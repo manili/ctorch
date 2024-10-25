@@ -1631,7 +1631,7 @@ int main(
 ) {
     DCG *graph = setup_application(42);
 
-    // mnist_test(graph, "/Users/mohammadaminnili/Desktop/mnist_train_small.csv");
+    // mnist_test(graph, "<CSV_PATH>");
     simple_test(graph);
 
     return 0;
