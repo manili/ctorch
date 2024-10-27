@@ -611,12 +611,22 @@ double ct_neg(
     return out;
 }
 
+double ct_exp(
+    double a,
+    double *out_grad_a
+) {
+    double out = exp(a);
+    if (out_grad_a) *out_grad_a = out;
+    
+    return out;
+}
+
 double ct_tanh(
     double a,
     double *out_grad_a
 ) {
-    double e_pos = exp(a);
-    double e_neg = exp(-a);
+    double e_pos = ct_exp(a, NULL);
+    double e_neg = ct_exp(-a, NULL);
     double out = (e_pos - e_neg) / (e_pos + e_neg);
     if (out_grad_a) *out_grad_a = 1 - (out * out);
 
@@ -659,13 +669,13 @@ double ct_pow2(
     double *out_grad_a
 ) {
     double out = a * a;
-    *out_grad_a = 2 * a;
+    if (out_grad_a) *out_grad_a = 2 * a;
 
     return out;
 }
 
 // Function to perform matrix multiplication on 2D arrays
-void matrix_multiply(
+void ct_matrix_multiply(
     double *a,
     double *b,
     double *out,
@@ -683,23 +693,115 @@ void matrix_multiply(
     }
 }
 
-void sum(
+void ct_sum(
     Tensor *tensor,
     Tensor **out_grad_tensor,
     Tensor **out_tensor
 ) {
     create_tensor_from_scalar(0.0, out_tensor);
     
-    for (int i = 0; i < tensor->total_size; i++) {
-        (*out_tensor)->data[0] += tensor->data[i];
+    if (out_grad_tensor) {
+        for (int i = 0; i < tensor->total_size; i++) {
+            (*out_tensor)->data[0] += tensor->data[i];
+        }
     }
 
     deep_copy_tensor(tensor, out_grad_tensor);
     init_tensor(*out_grad_tensor, 1.0);
 }
 
+void ct_softmax(
+    Tensor *tensor,
+    int dim,
+    Tensor **out_grad_tensor,
+    Tensor **out_tensor
+) {
+    // Create output tensor with the same shape as the input tensor
+    create_tensor(tensor->shape, tensor->dimensions, out_tensor);
+
+    // Calculate softmax along the specified dimension
+    int outer_size = 1, inner_size = 1;
+    for (int i = 0; i < dim; i++) outer_size *= tensor->shape[i];
+    for (int i = dim + 1; i < tensor->dimensions; i++) inner_size *= tensor->shape[i];
+
+    // Compute softmax along the specified dimension
+    for (int i = 0; i < outer_size; i++) {
+        for (int j = 0; j < inner_size; j++) {
+            // Calculate the sum of exponentials along `dim`
+            double sum_exp = 0.0;
+            for (int k = 0; k < tensor->shape[dim]; k++) {
+                int idx = (i * tensor->shape[dim] * inner_size) + (k * inner_size) + j;
+                sum_exp += ct_exp(tensor->data[idx], NULL);
+            }
+            // Calculate softmax for each element along `dim`
+            for (int k = 0; k < tensor->shape[dim]; k++) {
+                int idx = (i * tensor->shape[dim] * inner_size) + (k * inner_size) + j;
+                (*out_tensor)->data[idx] = ct_exp(tensor->data[idx], NULL) / sum_exp;
+            }
+        }
+    }
+
+    // If gradient tensor is requested, calculate Jacobian
+    if (out_grad_tensor) {
+        // Define shape for the Jacobian tensor
+        int shape[tensor->dimensions + 1];
+        for (int i = 0; i < tensor->dimensions + 1; i++) {
+            shape[i] = (i <= dim) ? tensor->shape[i] : tensor->shape[i - 1];
+        }
+        create_tensor(shape, tensor->dimensions + 1, out_grad_tensor);
+
+        int jacobian_indices[tensor->dimensions + 1];  // To hold indices in the Jacobian tensor
+
+        for (int i = 0; i < outer_size; i++) {
+            for (int j = 0; j < inner_size; j++) {
+                for (int m = 0; m < tensor->shape[dim]; m++) {
+                    int idx_m = (i * tensor->shape[dim] * inner_size) + (m * inner_size) + j;
+                    double sm_m = (*out_tensor)->data[idx_m];
+                    
+                    for (int n = 0; n < tensor->shape[dim]; n++) {
+                        int idx_n = (i * tensor->shape[dim] * inner_size) + (n * inner_size) + j;
+                        double sm_n = (*out_tensor)->data[idx_n];
+
+                        // Calculate gradient value
+                        double grad_value = (m == n) ? sm_m * (1 - sm_m) : -sm_m * sm_n;
+
+                        // Construct the full Jacobian index
+                        int original_indices[tensor->dimensions];  // To hold original indices
+                        int tmp = i * inner_size * tensor->shape[dim] + j;
+
+                        // Calculate all original indices, both before and after dim
+                        for (int d = tensor->dimensions - 1; d >= 0; d--) {
+                            if (d != dim) {
+                                original_indices[d] = tmp % tensor->shape[d];
+                                tmp /= tensor->shape[d];
+                            }
+                        }
+
+                        // Populate jacobian_indices with original indices, inserting m and n at the extra dimension
+                        for (int d = 0; d < tensor->dimensions + 1; d++) {
+                            if (d < dim) {
+                                jacobian_indices[d] = original_indices[d];
+                            } else if (d == dim) {
+                                jacobian_indices[d] = m; // For the softmax dim index m
+                            } else if (d == dim + 1) {
+                                jacobian_indices[d] = n; // For the softmax dim index n
+                            } else {
+                                jacobian_indices[d] = original_indices[d - 1];
+                            }
+                        }
+
+                        // Set the value in the Jacobian tensor
+                        int flat_idx = get_flat_index(*out_grad_tensor, jacobian_indices);
+                        (*out_grad_tensor)->data[flat_idx] = grad_value;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Function to perform batch matrix multiplication
-void matmul(
+void ct_matmul(
     Tensor *a,
     Tensor *b,
     Tensor **out_result
@@ -745,7 +847,7 @@ void matmul(
         double *out_slice = &(*out_result)->data[i * a_second_last_dim * b_last_dim];
 
         // Perform matrix multiplication for this slice
-        matrix_multiply(a_slice, b_slice, out_slice, a_second_last_dim, a_last_dim, b_last_dim);
+        ct_matrix_multiply(a_slice, b_slice, out_slice, a_second_last_dim, a_last_dim, b_last_dim);
     }
 
     // Free allocated memory
@@ -755,7 +857,7 @@ void matmul(
 }
 
 // Function to transpose a tensor by swapping two dimensions
-void transpose_tensor(
+void ct_transpose_tensor(
     Tensor *tensor,
     int dim1,
     int dim2,
@@ -800,10 +902,10 @@ void operation(
 ) {
     // Check if the operation is a single-argument double operation (single tensor element-wise)
     if (op != NULL && b == NULL) {
-        if ((void (*)(Tensor *, int, int, Tensor **))op == transpose_tensor) {
-            transpose_tensor(a, dim1, dim2, out_result);
-        } else if ((void (*)(Tensor *, Tensor **, Tensor **))op == sum) {
-            sum(a, out_grad_a, out_result);
+        if ((void (*)(Tensor *, int, int, Tensor **))op == ct_transpose_tensor) {
+            ct_transpose_tensor(a, dim1, dim2, out_result);
+        } else if ((void (*)(Tensor *, Tensor **, Tensor **))op == ct_sum) {
+            ct_sum(a, out_grad_a, out_result);
         } else {
             // Single-tensor operation
             double (*op_single)(double, double *) = (double (*)(double, double *))op;
@@ -822,9 +924,9 @@ void operation(
         }
     } else if (op != NULL && b != NULL) {
         // Check if the operation is matrix multiplication or element-wise tensor operation
-        if ((void (*)(Tensor *, Tensor *, Tensor **))op == matmul) {
+        if ((void (*)(Tensor *, Tensor *, Tensor **))op == ct_matmul) {
             // Batch matrix multiplication
-            matmul(a, b, out_result);
+            ct_matmul(a, b, out_result);
         } else {
             // Two-tensor operation with broadcasting
             double (*op_double)(double, double, double *, double *) = (double (*)(double, double, double *, double *))op;
@@ -1035,18 +1137,18 @@ void backward(DCG *graph, Tensor *lr) {
     }
 
     while (node) {
-        if (node->op == matmul) {
+        if (node->op == ct_matmul) {
             Tensor *input_T = NULL;
             Tensor *other_T = NULL;
-            transpose_tensor(node->input, node->dim1, node->dim2, &input_T);
-            transpose_tensor(node->other, node->dim1, node->dim2, &other_T);
-            operation(matmul, node->grad_output, other_T, node->dim1, node->dim2, NULL, NULL, &node->grad_input);
-            operation(matmul, input_T, node->grad_output, node->dim1, node->dim2, NULL, NULL, &node->grad_other);
-        } else if (node->op == transpose_tensor) {
+            ct_transpose_tensor(node->input, node->dim1, node->dim2, &input_T);
+            ct_transpose_tensor(node->other, node->dim1, node->dim2, &other_T);
+            operation(ct_matmul, node->grad_output, other_T, node->dim1, node->dim2, NULL, NULL, &node->grad_input);
+            operation(ct_matmul, input_T, node->grad_output, node->dim1, node->dim2, NULL, NULL, &node->grad_other);
+        } else if (node->op == ct_transpose_tensor) {
             if (node->node_type == ONLY_INPUT) {
-                transpose_tensor(node->grad_output, node->dim1, node->dim2, &node->grad_input);
+                ct_transpose_tensor(node->grad_output, node->dim1, node->dim2, &node->grad_input);
             } else if (node->node_type == ONLY_OTHER) {
-                transpose_tensor(node->grad_output, node->dim1, node->dim2, &node->grad_other);
+                ct_transpose_tensor(node->grad_output, node->dim1, node->dim2, &node->grad_other);
             }
         } else {
             Tensor *grad_input_tmp = NULL;
@@ -1144,12 +1246,12 @@ void forward_linearlayer(
         create_tensor((int[]) {io_ll->output_feature_size, io_ll->input_feature_size}, 2, &io_ll->W);
         init_tensor_rand(io_ll->W);
         Node *W_T_node = NULL;
-        create_node(ONLY_OTHER, transpose_tensor, 0, 1, true, &W_T_node);
+        create_node(ONLY_OTHER, ct_transpose_tensor, 0, 1, true, &W_T_node);
         io_ll->from_node = W_T_node;
         add_node(graph, W_T_node, io_ll->W);
 
         Node *X_W_T_node = NULL;
-        create_node(INPUT_OTHER, matmul, 0, 1, false, &X_W_T_node);
+        create_node(INPUT_OTHER, ct_matmul, 0, 1, false, &X_W_T_node);
         add_node(graph, X_W_T_node, NULL);
 
         if (io_ll->bias == true) {
@@ -1268,7 +1370,7 @@ void forward_mseloss(
         add_node(graph, sub_pow_mul_node, mseloss->n);
 
         Node *sub_pow_mul_sum_node = NULL;
-        create_node(ONLY_INPUT, sum, 0, 1, false, &sub_pow_mul_sum_node);
+        create_node(ONLY_INPUT, ct_sum, 0, 1, false, &sub_pow_mul_sum_node);
         add_node(graph, sub_pow_mul_sum_node, NULL);
         mseloss->to_node = sub_pow_mul_sum_node;
 
@@ -1632,7 +1734,7 @@ int main(
     DCG *graph = setup_application(42);
 
     // mnist_test(graph, "<CSV_PATH>");
-    simple_test(graph);
+    // simple_test(graph);
 
     return 0;
 }
