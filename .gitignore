@@ -54,3 +54,4 @@ dkms.conf
 # Misc
 .DS_Store
 ctorch
+mnist_train_small.csv

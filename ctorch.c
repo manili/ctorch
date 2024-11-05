@@ -133,13 +133,18 @@ void init_tensor(
     }
 }
 
-// Initialize all elements randomly between 0 and 1
+// Initialize all elements randomly between -sqrt(k) and sqrt(k)
 void init_tensor_rand(
-    Tensor *tensor
+    Tensor *tensor,
+    double k  // Parameter for controlling the range
 ) {
-    // Fill each element of the tensor with a random double between 0 and 1
+    double range = sqrt(k);  // Calculate sqrt(k) once for efficiency
+
+    // Fill each element of the tensor with a random double between -sqrt(k) and sqrt(k)
     for (int i = 0; i < tensor->total_size; i++) {
-        tensor->data[i] = (double)rand() / RAND_MAX;
+        // Generate a uniform random number in [-sqrt(k), sqrt(k)]
+        double random_value = ((double)rand() / RAND_MAX) * 2 - 1; // Uniformly in [-1, 1]
+        tensor->data[i] = random_value * range; // Scale to [-sqrt(k), sqrt(k)]
     }
 }
 
@@ -621,6 +626,16 @@ double ct_exp(
     return out;
 }
 
+double ct_log(
+    double a,
+    double *out_grad_a
+) {
+    double out = log(a);
+    if (out_grad_a) *out_grad_a = 1.0 / a;
+    
+    return out;
+}
+
 double ct_tanh(
     double a,
     double *out_grad_a
@@ -904,6 +919,8 @@ void operation(
     if (op != NULL && b == NULL) {
         if ((void (*)(Tensor *, int, int, Tensor **))op == ct_transpose_tensor) {
             ct_transpose_tensor(a, dim1, dim2, out_result);
+        } else if ((void (*)(Tensor *, int, Tensor **, Tensor **))op == ct_softmax) {
+            ct_softmax(a, dim1, out_grad_a, out_result);
         } else if ((void (*)(Tensor *, Tensor **, Tensor **))op == ct_sum) {
             ct_sum(a, out_grad_a, out_result);
         } else {
@@ -989,11 +1006,14 @@ typedef struct Node {
     int dim1;
     int dim2;
     
-    bool is_other_parameter;
+    bool bypass_backward;
+    bool other_parameter;
     
     Tensor *input;
     Tensor *other;
     Tensor *output;
+
+    Tensor *target;
 
     Tensor *grad_input;
     Tensor *grad_other;
@@ -1004,17 +1024,15 @@ typedef struct Node {
     struct Node *prev;
 } Node;
 
-typedef struct {
-    Node *first_node;
-    Node *last_node;
-} DCG;
-
 void create_node(
     enum NodeType node_type,
     void *op,
     int dim1,
     int dim2,
-    bool is_other_parameter,
+    bool bypass_backward,
+    bool other_parameter,
+    Tensor *other,
+    Node *prev_node,
     Node **out_node
 ) {
     // Dynamically allocate memory for the new node
@@ -1028,40 +1046,23 @@ void create_node(
     (*out_node)->dim1 = dim1;
     (*out_node)->dim2 = dim2;
 
-    (*out_node)->is_other_parameter = is_other_parameter;
+    (*out_node)->bypass_backward = bypass_backward;
+    (*out_node)->other_parameter = other_parameter;
 
     (*out_node)->input = NULL;
-    (*out_node)->other = NULL;
+    (*out_node)->other = other;
     (*out_node)->output = NULL;
+
+    (*out_node)->target = NULL;
 
     (*out_node)->grad_input = NULL;
     (*out_node)->grad_other = NULL;
     (*out_node)->grad_output = NULL;
 
     (*out_node)->next = NULL;
-    (*out_node)->prev = NULL;
-}
+    (*out_node)->prev = prev_node;
 
-void add_node(
-    DCG *graph,
-    Node *node,
-    Tensor *other
-) {
-    node->other = other;
-
-    node->next = NULL;
-    node->prev = graph->last_node;
-
-    // If this is the first node, initialize the first_node pointer
-    if (graph->first_node == NULL) {
-        graph->first_node = node;
-    } else {
-        // If not the first node, link the last node's next pointer to this node
-        graph->last_node->next = node;
-    }
-    
-    // Update the last_node to the new node
-    graph->last_node = node;
+    if (prev_node) prev_node->next = *out_node;
 }
 
 void feedforward(
@@ -1077,13 +1078,23 @@ void feedforward(
 
     // Traverse through the remaining nodes in the graph
     while (node != to_node->next) {
-        // Perform the operation and store the result in the output tensor
-        if (node->node_type == INPUT_OTHER) {
-            operation(node->op, node->input, node->other, node->dim1, node->dim2, &node->grad_input, &node->grad_other, &node->output);
-        } else if (node->node_type == ONLY_INPUT) {
-            operation(node->op, node->input, NULL, node->dim1, node->dim2, &node->grad_input, NULL, &node->output);
-        } else if (node->node_type == ONLY_OTHER) {
-            operation(node->op, node->other, NULL, node->dim1, node->dim2, &node->grad_other, NULL, &node->output);
+        // Perform the operation and its grads and store the result in the output tensors
+        if (node->bypass_backward || node->op == ct_softmax) {
+            if (node->node_type == INPUT_OTHER) {
+                operation(node->op, node->input, node->other, node->dim1, node->dim2, NULL, NULL, &node->output);
+            } else if (node->node_type == ONLY_INPUT) {
+                operation(node->op, node->input, NULL, node->dim1, node->dim2, NULL, NULL, &node->output);
+            } else if (node->node_type == ONLY_OTHER) {
+                operation(node->op, node->other, NULL, node->dim1, node->dim2, NULL, NULL, &node->output);
+            }
+        } else {
+            if (node->node_type == INPUT_OTHER) {
+                operation(node->op, node->input, node->other, node->dim1, node->dim2, &node->grad_input, &node->grad_other, &node->output);
+            } else if (node->node_type == ONLY_INPUT) {
+                operation(node->op, node->input, NULL, node->dim1, node->dim2, &node->grad_input, NULL, &node->output);
+            } else if (node->node_type == ONLY_OTHER) {
+                operation(node->op, node->other, NULL, node->dim1, node->dim2, &node->grad_other, NULL, &node->output);
+            }
         }
         
         if (node->next) {
@@ -1127,9 +1138,7 @@ void feedforward(
     *out_tensor = to_node->output;
 }
 
-void backward(DCG *graph, Tensor *lr) {
-    Node *node = graph->last_node;
-
+void backward(Node *node) {
     // Allocate memory for the output tensor
     if (!node->grad_output) {
         create_tensor(node->output->shape, node->output->dimensions, &node->grad_output);
@@ -1137,7 +1146,15 @@ void backward(DCG *graph, Tensor *lr) {
     }
 
     while (node) {
-        if (node->op == ct_matmul) {
+        if (node->bypass_backward) {
+            // Note that grad_output MUST have the same shape as grad_input or grad_other
+            deep_copy_tensor(node->grad_output, &node->grad_input);
+            deep_copy_tensor(node->grad_output, &node->grad_other);
+        } else if (node->op == ct_softmax) {
+            Tensor *grad_input_tmp = NULL;
+            operation(ct_sub, node->output, node->target, node->dim1, node->dim2, NULL, NULL, &grad_input_tmp);
+            operation(ct_mul, node->grad_output, grad_input_tmp, node->dim1, node->dim2, NULL, NULL, &node->grad_input);
+        } else if (node->op == ct_matmul) {
             Tensor *input_T = NULL;
             Tensor *other_T = NULL;
             ct_transpose_tensor(node->input, node->dim1, node->dim2, &input_T);
@@ -1161,14 +1178,6 @@ void backward(DCG *graph, Tensor *lr) {
             }
         }
 
-        if (node->is_other_parameter) {
-            Tensor *delta = NULL;
-            Tensor *other_tmp = NULL;
-            operation(ct_mul, lr, node->grad_other, node->dim1, node->dim2, NULL, NULL, &delta);
-            operation(ct_sub, node->other, delta, node->dim1, node->dim2, NULL, NULL, &other_tmp);
-            memcpy(node->other->data, other_tmp->data, other_tmp->total_size * sizeof(double));
-        }
-
         if (node->prev){
             if (node->prev->node_type == ONLY_OTHER) {
             node->prev->grad_output = node->grad_other;
@@ -1176,15 +1185,40 @@ void backward(DCG *graph, Tensor *lr) {
             } else {
                 node->prev->grad_output = node->grad_input;
             }
+
+            node->prev->target = node->target;
+        }
+
+        // /////////
+        // printf("Grad Output:\n\n");
+        // print_info(node->grad_output);
+        // printf("Grad Input:\n\n");
+        // print_info(node->grad_input);
+        // printf("Grad Other:\n\n");
+        // if (node->other) print_info(node->grad_other);
+        // printf("===>>>\n\n");
+        // /////////
+
+        node = node->prev;
+    }
+}
+
+void update_parameters(Node *node, Tensor *lr) {
+    while (node) {
+        if (node->other_parameter) {
+            Tensor *delta = NULL;
+            Tensor *other_tmp = NULL;
+            operation(ct_mul, lr, node->grad_other, node->dim1, node->dim2, NULL, NULL, &delta);
+            operation(ct_sub, node->other, delta, node->dim1, node->dim2, NULL, NULL, &other_tmp);
+            memcpy(node->other->data, other_tmp->data, other_tmp->total_size * sizeof(double));
         }
 
         node = node->prev;
     }
 }
 
-void free_graph(DCG *graph) {
+void free_graph(Node *node) {
     //TODO:
-    Node *node = graph->first_node;
     while (node != NULL) {
         Node *next_node = node->next;
         
@@ -1198,10 +1232,6 @@ void free_graph(DCG *graph) {
         
         node = next_node;
     }
-    
-    // Reset graph pointers
-    graph->first_node = NULL;
-    graph->last_node = NULL;
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1237,29 +1267,26 @@ LinearLayer *linearlayer(
 }
 
 void forward_linearlayer(
-    DCG *graph,
     LinearLayer *io_ll,
+    Node *last_node,
     Tensor *X,
     Tensor **out_tensor
 ) {
     if (io_ll->initiated == false) {
         create_tensor((int[]) {io_ll->output_feature_size, io_ll->input_feature_size}, 2, &io_ll->W);
-        init_tensor_rand(io_ll->W);
+        init_tensor_rand(io_ll->W, 1.0 / io_ll->input_feature_size);
         Node *W_T_node = NULL;
-        create_node(ONLY_OTHER, ct_transpose_tensor, 0, 1, true, &W_T_node);
+        create_node(ONLY_OTHER, ct_transpose_tensor, 0, 1, false, true, io_ll->W, last_node, &W_T_node);
         io_ll->from_node = W_T_node;
-        add_node(graph, W_T_node, io_ll->W);
 
         Node *X_W_T_node = NULL;
-        create_node(INPUT_OTHER, ct_matmul, 0, 1, false, &X_W_T_node);
-        add_node(graph, X_W_T_node, NULL);
+        create_node(INPUT_OTHER, ct_matmul, 0, 1, false, false, NULL, W_T_node, &X_W_T_node);
 
         if (io_ll->bias == true) {
             create_tensor((int[]) {X->shape[0], io_ll->output_feature_size}, 2, &io_ll->b);
-            init_tensor_rand(io_ll->b);
+            init_tensor_rand(io_ll->b, 1.0 / io_ll->input_feature_size);
             Node *b_node = NULL;
-            create_node(INPUT_OTHER, ct_add, 0, 1, true, &b_node);
-            add_node(graph, b_node, io_ll->b);
+            create_node(INPUT_OTHER, ct_add, 0, 1, false, true, io_ll->b, X_W_T_node, &b_node);
             io_ll->to_node = b_node;
         } else {
             io_ll->to_node = X_W_T_node;
@@ -1283,31 +1310,33 @@ typedef struct
     bool initiated;
 
     void *op;
+    int dim;
 
     Node *from_node;
     Node *to_node;
 } ActivationLayer;
 
 ActivationLayer *activation_layer(
-    void *op
+    void *op,
+    int dim
 ) {
     ActivationLayer *al = (ActivationLayer *)malloc(sizeof(ActivationLayer));
     al->op = op;
+    al->dim = dim;
     al->initiated = false;
 
     return al;
 }
 
 void forward_activationlayer(
-    DCG *graph,
     ActivationLayer *al,
+    Node *last_node,
     Tensor *X,
     Tensor **out_tensor
 ) {
     if (!al->initiated) {
         Node *act_node = NULL;
-        create_node(ONLY_INPUT, al->op, 0, 1, false, &act_node);
-        add_node(graph, act_node, NULL);
+        create_node(ONLY_INPUT, al->op, al->dim, 1, false, false, NULL, last_node, &act_node);
         al->from_node = act_node;
         al->to_node = act_node;
 
@@ -1326,9 +1355,8 @@ void free_activationlayer(ActivationLayer *activationlayer) {
 typedef struct {
     bool initiated;
 
-    Tensor *n;
+    Tensor *c;
     Tensor *two;
-    Tensor *cur_mse;
 
     Node *from_node;
     Node *to_node;
@@ -1341,38 +1369,35 @@ MSELoss *mseloss(
 
     mseloss->initiated = false;
     
-    create_tensor_from_scalar(1.0 / N, &mseloss->n);
+    create_tensor_from_scalar(1.0 / N, &mseloss->c);
     create_tensor_from_scalar(2.0, &mseloss->two);
-    create_tensor_from_scalar(0.0, &mseloss->cur_mse);
 
     return mseloss;
 }
 
 void forward_mseloss(
-    DCG *graph,
     MSELoss *mseloss,
+    Node *last_node,
     Tensor *X,
     Tensor *target,
     Tensor **out_tensor
 ) {
     if (!mseloss->initiated) {
         Node *sub_node = NULL;
-        create_node(INPUT_OTHER, ct_sub, 0, 1, false, &sub_node);
-        add_node(graph, sub_node, target);
+        create_node(INPUT_OTHER, ct_sub, 0, 1, false, false, target, last_node, &sub_node);
         mseloss->from_node = sub_node;
 
         Node *sub_pow_node = NULL;
-        create_node(INPUT_OTHER, ct_pow, 0, 1, false, &sub_pow_node);
-        add_node(graph, sub_pow_node, mseloss->two);
+        create_node(INPUT_OTHER, ct_pow, 0, 1, false, false, mseloss->two, sub_node, &sub_pow_node);
 
         Node *sub_pow_mul_node = NULL;
-        create_node(INPUT_OTHER, ct_mul, 0, 1, false, &sub_pow_mul_node);
-        add_node(graph, sub_pow_mul_node, mseloss->n);
+        create_node(INPUT_OTHER, ct_mul, 0, 1, false, false, mseloss->c, sub_pow_node, &sub_pow_mul_node);
 
         Node *sub_pow_mul_sum_node = NULL;
-        create_node(ONLY_INPUT, ct_sum, 0, 1, false, &sub_pow_mul_sum_node);
-        add_node(graph, sub_pow_mul_sum_node, NULL);
+        create_node(ONLY_INPUT, ct_sum, 0, 1, false, false, NULL, sub_pow_mul_node, &sub_pow_mul_sum_node);
         mseloss->to_node = sub_pow_mul_sum_node;
+
+        mseloss->to_node->target = target;
 
         mseloss->initiated = true;
     }
@@ -1381,10 +1406,112 @@ void forward_mseloss(
 }
 
 void free_mseloss(MSELoss *mseloss) {
-    free_tensor(mseloss->cur_mse, true);
     free_tensor(mseloss->two, true);
-    free_tensor(mseloss->n, true);
+    free_tensor(mseloss->c, true);
     free(mseloss);
+}
+
+typedef struct {
+    bool initiated;
+
+    Tensor *c;
+
+    Node *from_node;
+    Node *to_node;
+} NLLLoss;
+
+NLLLoss *nllloss(
+    int N
+) {
+    NLLLoss *nllloss = (NLLLoss *)malloc(sizeof(NLLLoss));
+
+    nllloss->initiated = false;
+    
+    create_tensor_from_scalar(-1.0 / N, &nllloss->c);
+
+    return nllloss;
+}
+
+void forward_nllloss(
+    NLLLoss *nllloss,
+    Node *last_node,
+    Tensor *X,
+    Tensor *target,
+    Tensor **out_tensor
+) {
+    if (!nllloss->initiated) {
+        Node *log_node = NULL;
+        create_node(ONLY_INPUT, ct_log, 0, 1, true, false, NULL, last_node, &log_node);
+        nllloss->from_node = log_node;
+
+        Node *log_mul_node = NULL;
+        create_node(INPUT_OTHER, ct_mul, 0, 1, true, false, target, log_node, &log_mul_node);
+
+        Node *log_mul_sum_node = NULL;
+        create_node(ONLY_INPUT, ct_sum, 0, 1, false, false, NULL, log_mul_node, &log_mul_sum_node);
+
+        Node *log_mul_sum_mul_node = NULL;
+        create_node(INPUT_OTHER, ct_mul, 0, 1, false, false, nllloss->c, log_mul_sum_node, &log_mul_sum_mul_node);
+        nllloss->to_node = log_mul_sum_mul_node;
+
+        nllloss->to_node->target = target;
+
+        nllloss->initiated = true;
+    }
+
+    feedforward(X, nllloss->from_node, nllloss->to_node, out_tensor);
+}
+
+void free_nllloss(NLLLoss *nllloss) {
+    free_tensor(nllloss->c, true);
+    free(nllloss);
+}
+
+typedef struct {
+    bool initiated;
+
+    ActivationLayer *softmax;
+    NLLLoss *nllloss;
+
+    Node *from_node;
+    Node *to_node;
+} CrossEntropyLoss;
+
+CrossEntropyLoss *crossentropyloss(
+    int N,
+    int dim
+) {
+    CrossEntropyLoss *crossentropyloss = (CrossEntropyLoss *)malloc(sizeof(CrossEntropyLoss));
+    crossentropyloss->softmax = activation_layer(ct_softmax, dim);
+    crossentropyloss->nllloss = nllloss(N);
+
+    crossentropyloss->initiated = false;
+
+    return crossentropyloss;
+}
+
+void forward_crossentropyloss(
+    CrossEntropyLoss *crossentropyloss,
+    Node *last_node,
+    Tensor *X,
+    Tensor *target,
+    Tensor **out_tensor
+) {
+    Tensor *y1 = NULL;
+    forward_activationlayer(crossentropyloss->softmax, last_node, X, &y1);
+    forward_nllloss(crossentropyloss->nllloss, crossentropyloss->softmax->to_node, y1, target, out_tensor);
+
+    if (!crossentropyloss->initiated) {
+        crossentropyloss->from_node = crossentropyloss->softmax->from_node;
+        crossentropyloss->to_node = crossentropyloss->nllloss->to_node;
+
+        crossentropyloss->initiated = true;
+    }
+}
+
+void free_crossentropyloss(NLLLoss *nllloss) {
+    free_tensor(nllloss->c, true);
+    free(nllloss);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1392,27 +1519,72 @@ void free_mseloss(MSELoss *mseloss) {
 #define NUM_IMAGES 20000  // Adjust this number if your dataset size differs
 #define IMAGE_SIZE 784    // Each image has 28x28 pixels
 
-double **mnist_images;  // Array of size [NUM_IMAGES][784] for training images
-int *mnist_labels;      // Array of size [NUM_IMAGES] for training labels
+typedef struct {
+    LinearLayer *ll1;
+    ActivationLayer *al1;
+    LinearLayer *ll2;
+    ActivationLayer *al2;
+    LinearLayer *ll3;
+    ActivationLayer *al3;
+    LinearLayer *ll4;
+    ActivationLayer *sm;
+    
+    NLLLoss *loss;
+} MNISTArch;
 
-// Helper function to allocate memory for MNIST images and labels
-void allocate_mnist_memory(
-    int num_images,
-    int image_size
-) {
-    // Allocate memory for the mnist_images array (2D array)
-    mnist_images = (double **)malloc(num_images * sizeof(double *));
-    for (int i = 0; i < num_images; i++) {
-        mnist_images[i] = (double *)malloc(image_size * sizeof(double));
-    }
+void mnistarch(int in_feature_size, int out_feature_size, int batch_size, MNISTArch **out_arch) {
+    *out_arch = (MNISTArch *)malloc(sizeof(MNISTArch));
 
-    // Allocate memory for the mnist_labels array (1D array)
-    mnist_labels = (int *)malloc(num_images * sizeof(int));
+    int hidden_size1 = 512;
+    int hidden_size2 = 256;
+    int hidden_size3 = 128;
+
+
+    // Initialize DNN layers
+    (*out_arch)->ll1 = linearlayer(in_feature_size, hidden_size1, true);    // Input -> Hidden Layer 1
+    (*out_arch)->al1 = activation_layer(ct_relu, -1);                       // Activation after Layer 1
+
+    (*out_arch)->ll2 = linearlayer(hidden_size1, hidden_size2, true);       // Hidden Layer 1 -> Hidden Layer 2
+    (*out_arch)->al2 = activation_layer(ct_relu, -1);                       // Activation after Layer 2
+
+    (*out_arch)->ll3 = linearlayer(hidden_size2, hidden_size3, true);       // Hidden Layer 2 -> Hidden Layer 3
+    (*out_arch)->al3 = activation_layer(ct_relu, -1);                       // Activation after Layer 3
+
+
+    (*out_arch)->ll4 = linearlayer(hidden_size3, out_feature_size, true);   // Hidden Layer 2 -> Hidden Layer 3
+    (*out_arch)->sm  = activation_layer(ct_softmax, 1);                     // Softmax
+
+    (*out_arch)->loss = nllloss(batch_size);                                // NLLLoss
+}
+
+void mnistforwad(MNISTArch *arch, Tensor *X, Tensor **y_pred) {
+    Tensor *y1 = NULL, *y2 = NULL, *y3 = NULL, *y4 = NULL;
+    Tensor *y5 = NULL, *y6 = NULL, *y7 = NULL;
+
+    forward_linearlayer(arch->ll1, NULL, X, &y1);
+    forward_activationlayer(arch->al1, arch->ll1->to_node, y1, &y2);
+
+    forward_linearlayer(arch->ll2, arch->al1->to_node, y2, &y3);
+    forward_activationlayer(arch->al2, arch->ll2->to_node, y3, &y4);
+    
+    forward_linearlayer(arch->ll3, arch->al2->to_node, y4, &y5);
+    forward_activationlayer(arch->al3, arch->ll3->to_node, y5, &y6);
+
+    forward_linearlayer(arch->ll4, arch->al3->to_node, y6, &y7);
+    forward_activationlayer(arch->sm, arch->ll4->to_node, y7, y_pred);
+}
+
+void mnistloss(MNISTArch *arch, Tensor *y_pred, Tensor *target, Tensor **loss) {
+    forward_nllloss(arch->loss, arch->sm->to_node, y_pred, target, loss);
 }
 
 // Function to load the MNIST dataset from a CSV file
 void load_mnist_dataset(
-    const char *mnist_csv_file
+    const char *mnist_csv_file,
+    int num_images,
+    int image_size,
+    double ***out_mnist_images, // Array of size [NUM_IMAGES][784] for training images
+    int **out_mnist_labels      // Array of size [NUM_IMAGES] for training labels
 ) {
     FILE *file = fopen(mnist_csv_file, "r");
     if (file == NULL) {
@@ -1420,8 +1592,14 @@ void load_mnist_dataset(
         exit(1);
     }
 
-    // Allocate memory for the dataset
-    allocate_mnist_memory(NUM_IMAGES, IMAGE_SIZE);
+    // Allocate memory for the mnist_images array (2D array)
+    *out_mnist_images = (double **)malloc(num_images * sizeof(double *));
+    for (int i = 0; i < num_images; i++) {
+        (*out_mnist_images)[i] = (double *)malloc(image_size * sizeof(double));
+    }
+
+    // Allocate memory for the mnist_labels array (1D array)
+    *out_mnist_labels = (int *)malloc(num_images * sizeof(int));
 
     // Read each line in the CSV file (assuming the first column is the label)
     char line[4096];  // Large enough to hold a line with 785 values (label + 784 pixels)
@@ -1431,13 +1609,14 @@ void load_mnist_dataset(
         char *token = strtok(line, ",");  // Tokenize the line by commas
 
         // First token is the label
-        mnist_labels[image_idx] = atoi(token);
+        (*out_mnist_labels)[image_idx] = atoi(token);
 
         // Read the next 784 tokens for pixel values
         for (int i = 0; i < IMAGE_SIZE; i++) {
             token = strtok(NULL, ",");
             if (token != NULL) {
-                mnist_images[image_idx][i] = atof(token) / 255.0;  // Normalize pixel value
+                double transformed_pixel = atof(token) / 255.0; // Transform pixel [0, 255] -> [0, 1.0]
+                (*out_mnist_images)[image_idx][i] =  (transformed_pixel - 0.5) / 0.5; // Normalize pixel value
             }
         }
 
@@ -1452,21 +1631,12 @@ void load_mnist_dataset(
     fclose(file);
 }
 
-// Helper function to one-hot encode the labels
-void one_hot_encode(
-    int label,
-    double *encoded_label,
-    int num_classes
-) {
-    for (int i = 0; i < num_classes; i++) {
-        encoded_label[i] = (i == label) ? 1.0 : 0.0;
-    }
-}
-
 // Function to load a batch of MNIST data into tensors X and Y
 void load_mnist_batch(
-    Tensor *X,
-    Tensor *Y,
+    Tensor *io_X,
+    Tensor *io_Y,
+    double **mnist_images,
+    int *mnist_labels,
     int batch_idx,
     int batch_size
 ) {
@@ -1478,33 +1648,39 @@ void load_mnist_batch(
 
         // Load the image and flatten it into a 784-length vector
         for (int j = 0; j < 784; j++) {
-            set_element(X, mnist_images[data_idx][j], i, j);  // Normalize the pixel value
+            set_element(io_X, mnist_images[data_idx][j], i, j);  // Normalize the pixel value
         }
 
         // Load the label and one-hot encode it into a 10-length vector
         double one_hot_label[10] = {0};
-        one_hot_encode(mnist_labels[data_idx], one_hot_label, 10);
+        for (int i = 0; i < 10; i++) {
+            one_hot_label[i] = (i == mnist_labels[data_idx]) ? 1.0 : 0.0;
+        }
 
         for (int j = 0; j < 10; j++) {
-            set_element(Y, one_hot_label[j], i, j);
+            set_element(io_Y, one_hot_label[j], i, j);
         }
     }
 }
 
 void mnist_test(
-    DCG *graph,
     const char *mnist_csv_file
 ) {
+    double **mnist_images = NULL;
+    int *mnist_labels = NULL;
+
     // Load the MNIST dataset from the CSV file
-    load_mnist_dataset(mnist_csv_file);
+    load_mnist_dataset(mnist_csv_file, NUM_IMAGES, IMAGE_SIZE, &mnist_images, &mnist_labels);
 
     // Define hyperparameters
+    int training_size = 10000;
     int batch_size = 64;
-    int num_batches = 300;  // Number of batches in the epoch (adjust accordingly)
-    int epoch = 10;
+    int num_batches = training_size / batch_size;   // Number of batches in the epoch (adjust accordingly)
+    int num_batches_to_print = 312;                 // Number of batches in the epoch to print result
+    int epoch = 1000;
     double lr = 0.001;       // Learning rate
 
-    // Define DNN architecture: 784 -> 128 -> 64 -> 10
+    // Define DNN architecture: 784 -> 512 -> 128 -> 10
     int input_size = 784;  // Flattened MNIST image (28 * 28)
     int output_size = 10;  // MNIST has 10 classes (digits 0-9)
 
@@ -1515,20 +1691,12 @@ void mnist_test(
     create_tensor(X_shape, 2, &X);  // Create (batch_size, 784) tensor
     create_tensor(Y_shape, 2, &Y);  // Create (batch_size, 10) tensor
 
-    // Initialize DNN layers
-    LinearLayer *ll1 = linearlayer(input_size, 128, false); // Input -> Hidden Layer 1
-    ActivationLayer *al1 = activation_layer(ct_relu);       // Activation after Layer 1
-    LinearLayer *ll2 = linearlayer(128, 64, false);         // Hidden Layer 1 -> Hidden Layer 2
-    ActivationLayer *al2 = activation_layer(ct_relu);       // Activation after Layer 2
-    LinearLayer *ll3 = linearlayer(64, output_size, false); // Hidden Layer 2 -> Output Layer
-
-    MSELoss *mse = mseloss(output_size * batch_size);       // Loss layer (Mean Squared Error)
-
     Tensor *tensor_lr = NULL;
-    create_tensor_from_scalar(lr, &tensor_lr);              // Learning rate as a scalar tensor
+    create_tensor_from_scalar(lr, &tensor_lr);  // Learning rate as a scalar tensor
 
-    Tensor *y1 = NULL, *y2 = NULL, *y3 = NULL, *y4 = NULL, *y_pred = NULL;
-    Tensor *out_mse = NULL;
+    // Initialize DNN layers
+    MNISTArch *arch = NULL;
+    mnistarch(input_size, output_size, batch_size, &arch);
 
     // Assume load_mnist_batch loads the MNIST batch of images and labels
     // You will need to implement this function or load the data accordingly.
@@ -1536,29 +1704,34 @@ void mnist_test(
     for (int e = 1; e <= epoch; e++) {
         printf("Epoch: %d/%d\n", e, epoch);
         
-        for (int b = 1; b <= num_batches; b++) {
+        double accumulated_epoch_loss = 0.0;
+        for (int b = 0; b < num_batches; b++) {
             // Load a batch of data (X, Y)
-            load_mnist_batch(X, Y, b, batch_size);  // You will need to implement this function
+            load_mnist_batch(X, Y, mnist_images, mnist_labels, b, batch_size);
 
             // Forward pass through the DNN
-            forward_linearlayer(graph, ll1, X, &y1);
-            forward_activationlayer(graph, al1, y1, &y2);
-            forward_linearlayer(graph, ll2, y2, &y3);
-            forward_activationlayer(graph, al2, y3, &y4);
-            forward_linearlayer(graph, ll3, y4, &y_pred);
+            Tensor *y_pred = NULL;
+            mnistforwad(arch, X, &y_pred);
+
+            // Loss calculation
+            Tensor *out_loss = NULL;
+            mnistloss(arch, y_pred, Y, &out_loss);
+            accumulated_epoch_loss += out_loss->data[0];
+
+            // Backpropagation of gradients
+            backward(arch->loss->to_node);
             
-            forward_mseloss(graph, mse, y_pred, Y, &out_mse);
+            // Update weights
+            update_parameters(arch->loss->to_node, tensor_lr);
 
-            // Backward pass to update weights
-            backward(graph, tensor_lr);
-
-            // Every 100 batches, print the loss (MSE)
-            if (b % 100 == 0) {
-                printf("Batch %d/%d - MSE Loss:\n", b, num_batches);
-                print_info(out_mse);  // Print the loss tensor
-                printf("-------------------\n");
-            }
+            // Print the loss
+            // if ((b + 1) % num_batches_to_print == 0) {
+            //     printf("Batch %d/%d - Loss:\n", b + 1, num_batches);
+            //     print_info(out_loss);  // Print the loss tensor
+            //     printf("-------------------\n");
+            // }
         }
+        printf("%.16f\n\n", accumulated_epoch_loss);
     }
 }
 
@@ -1566,6 +1739,37 @@ void mnist_test(
 
 #define SIMPLE_TEST_DATASET_SIZE 64000
 #define SIMPLE_TEST_FEATURE_SIZE 1
+
+typedef struct {
+    LinearLayer *ll1;
+    LinearLayer *ll2;
+    ActivationLayer *al;
+    
+    MSELoss *loss;
+} SimpleArch;
+
+void simplearch(int input_size, int output_size, int batch_size, SimpleArch **out_arch) {
+    *out_arch = (SimpleArch *)malloc(sizeof(SimpleArch));
+
+    // Initialize DNN layers
+    (*out_arch)->ll1 = linearlayer(input_size, 1, false);
+    (*out_arch)->ll2 = linearlayer(1, output_size, false);
+    (*out_arch)->al  = activation_layer(ct_pow2, -1);
+
+    (*out_arch)->loss = mseloss(output_size * batch_size);
+}
+
+void simpleforwad(SimpleArch *arch, Tensor *X, Tensor **y_pred) {
+    Tensor *y1 = NULL, *y2 = NULL;
+
+    forward_linearlayer(arch->ll1, NULL, X, &y1);
+    forward_linearlayer(arch->ll2, arch->ll1->to_node, y1, &y2);
+    forward_activationlayer(arch->al, arch->ll2->to_node, y2, y_pred);
+}
+
+void simpleloss(SimpleArch *arch, Tensor *y_pred, Tensor *target, Tensor **loss) {
+    forward_mseloss(arch->loss, arch->al->to_node, y_pred, target, loss);
+}
 
 void shuffle_data(
     Tensor *X, 
@@ -1652,13 +1856,13 @@ void load_simple_test_batch(
     }
 }
 
-void simple_test(DCG *graph) {
+void simple_test() {
     int dataset_size = SIMPLE_TEST_DATASET_SIZE;
     int feature_size = SIMPLE_TEST_FEATURE_SIZE;
 
     int batch_size = 64;
     int num_batches = 1000;
-    int epoch = 1000;
+    int epoch = 5;
     double lr = 0.001;
 
     Tensor *X_dataset = NULL, *Y_dataset = NULL;
@@ -1674,13 +1878,9 @@ void simple_test(DCG *graph) {
     Tensor *tensor_lr = NULL;
     create_tensor_from_scalar(lr, &tensor_lr);
 
-    LinearLayer *ll1 = linearlayer(X->shape[1], 1, false);
-    LinearLayer *ll2 = linearlayer(1, Y->shape[1], false);
-    ActivationLayer *al = activation_layer(ct_pow2);
-    MSELoss *mse = mseloss(feature_size * batch_size);
-
-    Tensor *y1 = NULL, *y2 = NULL, *y_pred = NULL;
-    Tensor *out_mse = NULL;
+    // Initialize DNN layers
+    SimpleArch *arch = NULL;
+    simplearch(feature_size, feature_size, batch_size, &arch);
 
     for (int i = 1; i < epoch + 1; i++) {
         printf("Epoch: %d/%d\n\n", i, epoch);
@@ -1688,28 +1888,83 @@ void simple_test(DCG *graph) {
         for (int j = 0; j < num_batches + 1; j++) {
             load_simple_test_batch(X_dataset, Y_dataset, j, batch_size, feature_size, X, Y);
 
-            forward_linearlayer(graph, ll1, X, &y1);
-            forward_linearlayer(graph, ll2, y1, &y2);
-            forward_activationlayer(graph, al, y2, &y_pred);
-            forward_mseloss(graph, mse, y_pred, Y, &out_mse);
+            // Forward pass through the DNN
+            Tensor *y_pred = NULL;
+            simpleforwad(arch, X, &y_pred);
 
-            backward(graph, tensor_lr);
+            // Loss calculation
+            Tensor *out_loss = NULL;
+            simpleloss(arch, y_pred, Y, &out_loss);
+
+            // Backpropagation of gradients
+            backward(arch->loss->to_node);
+            
+            // Update weights
+            update_parameters(arch->loss->to_node, tensor_lr);
+
+            // Every 100 batches, print the loss (MSE)
+            if (j % 100 == 0) {
+                printf("Batch %d/%d:\n", j, num_batches);
+                printf("W1:\n");
+                print_info(arch->ll1->W);
+                printf("W2:\n");
+                print_info(arch->ll2->W);
+                printf("Loss:\n");
+                print_info(out_loss);  // Print the loss tensor
+                printf("-------------------\n");
+            }
         }
-        
-        printf("W1:\n");
-        print_info(ll1->W);
-        printf("W2:\n");
-        print_info(ll2->W);
-        printf("MSE Loss:\n");
-        print_info(out_mse);  // Print the loss tensor
-        printf("-------------------\n");
     }
 }
 
 /////////////////////////////////////////////////////////////////////
 
+void simple_test2() {
+    int shape[2] = {3, 3};
+    Tensor *x = NULL;
+    create_tensor(shape, 2, &x);
+    Tensor *y = NULL;
+    create_tensor(shape, 2, &y);
+
+    set_element(x, 1, 0, 0);
+    set_element(x, 3, 0, 1);
+    set_element(x, 5, 0, 2);
+    set_element(x, 3, 1, 0);
+    set_element(x, 2, 1, 1);
+    set_element(x, 10, 1, 2);
+    set_element(x, 7, 2, 0);
+    set_element(x, 4, 2, 1);
+    set_element(x, 7, 2, 2);
+    
+    set_element(y, 1, 0, 0);
+    set_element(y, 0, 0, 1);
+    set_element(y, 0, 0, 2);
+    set_element(y, 0, 1, 0);
+    set_element(y, 0, 1, 1);
+    set_element(y, 1, 1, 2);
+    set_element(y, 1, 2, 0);
+    set_element(y, 0, 2, 1);
+    set_element(y, 0, 2, 2);
+
+    CrossEntropyLoss *cel = crossentropyloss(3, 1);
+
+    Tensor *loss = NULL;
+    forward_crossentropyloss(cel, NULL, x, y, &loss);
+
+    print_info(x);
+    print_info(y);
+    print_info(loss);
+
+    backward(cel->to_node);
+
+    print_info(cel->softmax->to_node->grad_output);
+    print_info(cel->softmax->to_node->grad_input);
+}
+
+/////////////////////////////////////////////////////////////////////
+
 // Function to setup the whole application
-DCG *setup_application(
+void setup_application(
     int default_seed
 ) {
     // Seed value for random number generation
@@ -1718,23 +1973,17 @@ DCG *setup_application(
 
     // Seed the random number generator, usually done once per program run
     srand(seed);
-
-    // Initialize DCG
-    DCG *graph = (DCG *)malloc(sizeof(DCG));
-    graph->first_node = NULL;
-    graph->last_node = NULL;
-
-    return graph;
 }
 
 int main(
     int argc,
     char *argv[]
 ) {
-    DCG *graph = setup_application(42);
+    setup_application(-1);
 
-    // mnist_test(graph, "<CSV_PATH>");
-    // simple_test(graph);
+    mnist_test("./mnist_train_small.csv");
+    // simple_test();
+    // simple_test2();
 
     return 0;
 }
