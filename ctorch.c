@@ -125,8 +125,8 @@ void create_tensor_from_tensor(
 
 // Initialize all elements to default_vlaue
 void init_tensor(
-    Tensor *tensor,
-    double default_vlaue
+    double default_vlaue,
+    Tensor *tensor
 ) {
     for (int i = 0; i < tensor->total_size; i++) {
         tensor->data[i] = default_vlaue;
@@ -135,8 +135,8 @@ void init_tensor(
 
 // Initialize all elements randomly between -sqrt(k) and sqrt(k)
 void init_tensor_rand(
-    Tensor *tensor,
-    double k  // Parameter for controlling the range
+    double k,       // Parameter for controlling the range
+    Tensor *tensor
 ) {
     double range = sqrt(k);  // Calculate sqrt(k) once for efficiency
 
@@ -146,6 +146,31 @@ void init_tensor_rand(
         double random_value = ((double)rand() / RAND_MAX) * 2 - 1; // Uniformly in [-1, 1]
         tensor->data[i] = random_value * range; // Scale to [-sqrt(k), sqrt(k)]
     }
+}
+
+// Initialize all elements from a previous specified values in a file
+void init_tensor_file(
+    const char *filename,
+    Tensor *tensor
+) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        printf("Error: Unable to open file %s\n", filename);
+        exit(1);
+    }
+
+    // Read each line in the file
+    char line[4096];  // Large enough to hold a line with 785 values (label + 784 pixels)
+    int idx = 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        char *token = strtok(line, "\n");  // Tokenize the line by commas
+
+        // First token is the label
+        tensor->data[idx++] = atof(token);
+    }
+
+    fclose(file);
 }
 
 // Function to calculate the flattened index for the tensor from multi-dimensional indices
@@ -722,7 +747,7 @@ void ct_sum(
     }
 
     deep_copy_tensor(tensor, out_grad_tensor);
-    init_tensor(*out_grad_tensor, 1.0);
+    init_tensor(1.0, *out_grad_tensor);
 }
 
 void ct_softmax(
@@ -1142,7 +1167,7 @@ void backward(Node *node) {
     // Allocate memory for the output tensor
     if (!node->grad_output) {
         create_tensor(node->output->shape, node->output->dimensions, &node->grad_output);
-        init_tensor(node->grad_output, 1.0);
+        init_tensor(1.0, node->grad_output);
     }
 
     while (node) {
@@ -1274,7 +1299,7 @@ void forward_linearlayer(
 ) {
     if (io_ll->initiated == false) {
         create_tensor((int[]) {io_ll->output_feature_size, io_ll->input_feature_size}, 2, &io_ll->W);
-        init_tensor_rand(io_ll->W, 1.0 / io_ll->input_feature_size);
+        init_tensor_rand(1.0 / io_ll->input_feature_size, io_ll->W);
         Node *W_T_node = NULL;
         create_node(ONLY_OTHER, ct_transpose_tensor, 0, 1, false, true, io_ll->W, last_node, &W_T_node);
         io_ll->from_node = W_T_node;
@@ -1284,7 +1309,7 @@ void forward_linearlayer(
 
         if (io_ll->bias == true) {
             create_tensor((int[]) {X->shape[0], io_ll->output_feature_size}, 2, &io_ll->b);
-            init_tensor_rand(io_ll->b, 1.0 / io_ll->input_feature_size);
+            init_tensor_rand(1.0 / io_ll->input_feature_size, io_ll->b);
             Node *b_node = NULL;
             create_node(INPUT_OTHER, ct_add, 0, 1, false, true, io_ll->b, X_W_T_node, &b_node);
             io_ll->to_node = b_node;
@@ -1673,12 +1698,12 @@ void mnist_test(
     load_mnist_dataset(mnist_csv_file, NUM_IMAGES, IMAGE_SIZE, &mnist_images, &mnist_labels);
 
     // Define hyperparameters
-    int training_size = 10000;
+    int training_size = 20000;
     int batch_size = 64;
-    int num_batches = training_size / batch_size;   // Number of batches in the epoch (adjust accordingly)
-    int num_batches_to_print = 312;                 // Number of batches in the epoch to print result
-    int epoch = 1000;
-    double lr = 0.001;       // Learning rate
+    int num_batches = ceil(training_size * 1.0 / batch_size);   // Number of batches in the epoch (adjust accordingly)
+    int num_batches_to_print = 312;                             // Number of batches in the epoch to print result
+    int epoch = 10;
+    double lr = 0.1;       // Learning rate
 
     // Define DNN architecture: 784 -> 512 -> 128 -> 10
     int input_size = 784;  // Flattened MNIST image (28 * 28)
