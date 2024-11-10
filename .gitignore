@@ -56,3 +56,4 @@ dkms.conf
 ctorch
 mnist_train_small.csv
 output_weights.txt
+mnist_test.csv

@@ -47,10 +47,12 @@ void free_tensor(
     Tensor *tensor,
     bool free_data
 ) {
-    free(tensor->shape);
-    free(tensor->strides);
-    free(tensor->org_strides);
-    if (free_data) free(tensor->data);
+    if (tensor == NULL) return;
+
+    free(tensor->shape); tensor->shape = NULL;
+    free(tensor->strides); tensor->strides = NULL;
+    free(tensor->org_strides); tensor->org_strides = NULL;
+    if (free_data) { free(tensor->data); tensor->data = NULL; }
     free(tensor);
 }
 
@@ -148,8 +150,35 @@ void init_tensor_rand(
     }
 }
 
+#include <stdio.h>
+#include <stdlib.h>
+
+// Function to store tensor values in a file with specified precision
+void store_tensor(
+    const char *filename,
+    Tensor *tensor,
+    int precision
+) {
+    FILE *file = fopen(filename, "w");
+    if (file == NULL) {
+        printf("Error: Unable to open file %s\n", filename);
+        exit(1);
+    }
+
+    // Format string to control precision, e.g., "%.3f\n" for 3 decimal places
+    char format[10];
+    snprintf(format, sizeof(format), "%%.%df\n", precision);
+
+    // Write each element of the tensor's data to the file with the specified precision
+    for (int i = 0; i < tensor->total_size; i++) {
+        fprintf(file, format, tensor->data[i]);
+    }
+
+    fclose(file);
+}
+
 // Initialize all elements from a previous specified values in a file
-void init_tensor_file(
+void load_tensor(
     const char *filename,
     Tensor *tensor
 ) {
@@ -339,25 +368,40 @@ bool equal_exclude_data(
     return true;
 }
 
+// Print double number with specified precision
+void __print_double(
+    double number,
+    int precision
+) {
+    // Format string to control precision dynamically
+    char format[50];
+    snprintf(format, sizeof(format), "%%.%df", precision);
+
+    // Print the number with the specified precision
+    printf(format, number);
+}
+
 // Print info of a tensor
-void __print_info(
+void __print_info_helper(
     Tensor *tensor,
+    int precision,
     int dim,
     int* index
 ) {
     if (tensor->dimensions == 1 && tensor->shape[0] == 1) {
-        printf("[%.4f]", tensor->data[0]);
+        printf("[");
+        __print_double(tensor->data[0], precision);
+        printf("]");
     } else if (dim < tensor->dimensions - 1) {
         printf("[");
         for (int i = 0; i < tensor->shape[dim]; i++) {
             index[dim] = i; 
-            __print_info(tensor, dim + 1, index);
+            __print_info_helper(tensor, precision, dim + 1, index);
             if (i < tensor->shape[dim] - 1) {
                 printf(",\n");
                 for (int j = 0; j < tensor->dimensions - 2 - dim; j++) {
                     printf("\n");
                 }
-                
             }
         }
         printf("]");
@@ -368,9 +412,10 @@ void __print_info(
             int flat_idx = get_flat_index(tensor, index);
 
             if (i == tensor->shape[dim] - 1) {
-                printf("%.4f", tensor->data[flat_idx]);
+                __print_double(tensor->data[flat_idx], precision);
             } else {
-                printf("%.4f, ", tensor->data[flat_idx]);
+                __print_double(tensor->data[flat_idx], precision);
+                printf(", ");
             }
         }
         printf("]");
@@ -378,8 +423,9 @@ void __print_info(
 }
 
 // Print info of a tensor
-void print_info(
-    Tensor *tensor
+void __print_info(
+    Tensor *tensor,
+    int precision
 ) {
     int *index = (int *)malloc(tensor->dimensions * sizeof(int));
     for (int i = 0; i < tensor->dimensions; i++) {
@@ -389,7 +435,7 @@ void print_info(
     printf("[");
     for (int i = 0; i < tensor->shape[0]; i++) {
         index[0] = i;
-        __print_info(tensor, 1, index);
+        __print_info_helper(tensor, precision, 1, index);
         if (i < tensor->shape[0] - 1) {
             printf(",\n");
             for (int j = 0; j < tensor->dimensions - 2; j++) {
@@ -411,6 +457,19 @@ void print_info(
     printf(")\n\n");
     
     free(index);
+}
+
+void print_info(
+    Tensor *tensor
+) {
+    __print_info(tensor, 4);
+}
+
+void print_info_with_precision(
+    Tensor *tensor,
+    int precision
+) {
+    __print_info(tensor, precision);
 }
 
 void print(
@@ -500,7 +559,6 @@ void broadcast(
                 broadcast_shape_b[i] = dim_b;
             } else if (dim_b == 1) {
                 broadcast_shape_b[i] = dim_a;
-                dim_b = dim_a;
             } else {
                 fprintf(stderr, "Error: Tensors are not broadcastable.\n");
                 exit(EXIT_FAILURE);
@@ -735,20 +793,81 @@ void ct_matrix_multiply(
 
 void ct_sum(
     Tensor *tensor,
+    int dim,
     Tensor **out_grad_tensor,
     Tensor **out_tensor
 ) {
-    create_tensor_from_scalar(0.0, out_tensor);
-    
-    if (out_grad_tensor) {
+    if (dim < 0) {
+        // Sum all elements in the tensor
+        create_tensor_from_scalar(0.0, out_tensor);
         for (int i = 0; i < tensor->total_size; i++) {
             (*out_tensor)->data[0] += tensor->data[i];
         }
-    }
+        
+        // Create gradient tensor with all entries set to 1 for broadcasting
+        if (out_grad_tensor) {
+            create_tensor(tensor->shape, tensor->dimensions, out_grad_tensor);
+            init_tensor(1.0, *out_grad_tensor);
+        }
 
-    deep_copy_tensor(tensor, out_grad_tensor);
-    init_tensor(1.0, *out_grad_tensor);
+    } else {
+        // Compute the new shape by removing the specified dimension and create output tensor
+        if (tensor->dimensions == 2) {
+            int new_shape[tensor->dimensions];
+            for (int i = 0, j = 0; i < tensor->dimensions; i++) {
+                if (i != dim) {
+                    new_shape[j++] = tensor->shape[i];
+                } else {
+                    new_shape[j++] = 1;
+                }
+            }
+            create_tensor(new_shape, tensor->dimensions, out_tensor);
+        } else {
+            int new_shape[tensor->dimensions - 1];
+            for (int i = 0, j = 0; i < tensor->dimensions; i++) {
+                if (i != dim) {
+                    new_shape[j++] = tensor->shape[i];
+                }
+            }
+            create_tensor(new_shape, tensor->dimensions - 1, out_tensor);
+        }
+
+        int outer_size = 1, inner_size = 1;
+        for (int i = 0; i < dim; i++) outer_size *= tensor->shape[i];
+        for (int i = dim + 1; i < tensor->dimensions; i++) inner_size *= tensor->shape[i];
+
+        // Sum along the specified dimension
+        for (int i = 0; i < outer_size; i++) {
+            for (int j = 0; j < inner_size; j++) {
+                double sum = 0.0;
+                for (int k = 0; k < tensor->shape[dim]; k++) {
+                    int idx = (i * tensor->shape[dim] * inner_size) + (k * inner_size) + j;
+                    sum += tensor->data[idx];
+                }
+                int out_idx = i * inner_size + j;
+                (*out_tensor)->data[out_idx] = sum;
+            }
+        }
+
+        // Create the gradient tensor for backpropagation if requested
+        if (out_grad_tensor) {
+            create_tensor(tensor->shape, tensor->dimensions, out_grad_tensor);
+            init_tensor(0.0, *out_grad_tensor);
+
+            // Distribute the gradients equally across summed elements
+            for (int i = 0; i < outer_size; i++) {
+                for (int j = 0; j < inner_size; j++) {
+                    int out_idx = i * inner_size + j;
+                    for (int k = 0; k < tensor->shape[dim]; k++) {
+                        int idx = (i * tensor->shape[dim] * inner_size) + (k * inner_size) + j;
+                        (*out_grad_tensor)->data[idx] = 1.0;
+                    }
+                }
+            }
+        }
+    }
 }
+
 
 void ct_softmax(
     Tensor *tensor,
@@ -946,8 +1065,8 @@ void operation(
             ct_transpose_tensor(a, dim1, dim2, out_result);
         } else if ((void (*)(Tensor *, int, Tensor **, Tensor **))op == ct_softmax) {
             ct_softmax(a, dim1, out_grad_a, out_result);
-        } else if ((void (*)(Tensor *, Tensor **, Tensor **))op == ct_sum) {
-            ct_sum(a, out_grad_a, out_result);
+        } else if ((void (*)(Tensor *, int, Tensor **, Tensor **))op == ct_sum) {
+            ct_sum(a, dim1, out_grad_a, out_result);
         } else {
             // Single-tensor operation
             double (*op_single)(double, double *) = (double (*)(double, double *))op;
@@ -1044,12 +1163,44 @@ typedef struct Node {
     Tensor *grad_other;
     Tensor *grad_output;
 
+    Tensor **retained_grad_input;
+    Tensor **retained_grad_other;
+
     // Pointers for linked list structure
     struct Node *next;
     struct Node *prev;
 } Node;
 
-void create_node(
+void free_node(Node *node) {
+    if (node == NULL) return;
+
+    // Free all associated Tensors, checking if they exist
+    bool data_dispose = node->op != ct_transpose_tensor;
+
+    if (node->output) {
+        free_tensor(node->output, data_dispose);
+        node->output = NULL;
+    }
+    
+    if (node->grad_input && (node->node_type == ONLY_INPUT || node->node_type == INPUT_OTHER)) {
+        free_tensor(node->grad_input, data_dispose);
+        node->grad_input = NULL;
+    }
+    
+    if (node->grad_other && (node->node_type == ONLY_OTHER || node->node_type == INPUT_OTHER)) {
+        free_tensor(node->grad_other, data_dispose);
+        node->grad_other = NULL;
+    }
+
+    // Set next and prev to NULL for safety in a linked list
+    if (node->prev) node->prev->next = node->next;
+    if (node->next) node->next->prev = node->prev;
+
+    // Free the node itself
+    free(node);
+}
+
+void __create_node(
     enum NodeType node_type,
     void *op,
     int dim1,
@@ -1058,6 +1209,8 @@ void create_node(
     bool other_parameter,
     Tensor *other,
     Node *prev_node,
+    Tensor **out_grad_input,
+    Tensor **out_grad_other,
     Node **out_node
 ) {
     // Dynamically allocate memory for the new node
@@ -1084,10 +1237,43 @@ void create_node(
     (*out_node)->grad_other = NULL;
     (*out_node)->grad_output = NULL;
 
+    (*out_node)->retained_grad_input = out_grad_input;
+    (*out_node)->retained_grad_other = out_grad_other;
+
     (*out_node)->next = NULL;
     (*out_node)->prev = prev_node;
 
     if (prev_node) prev_node->next = *out_node;
+}
+
+void create_node(
+    enum NodeType node_type,
+    void *op,
+    int dim1,
+    int dim2,
+    bool bypass_backward,
+    bool other_parameter,
+    Tensor *other,
+    Node *prev_node,
+    Node **out_node
+) {
+    __create_node(node_type, op, dim1, dim2, bypass_backward, other_parameter, other, prev_node, NULL, NULL, out_node);
+}
+
+void create_node_retain_grad(
+    enum NodeType node_type,
+    void *op,
+    int dim1,
+    int dim2,
+    bool bypass_backward,
+    bool other_parameter,
+    Tensor *other,
+    Node *prev_node,
+    Tensor **out_grad_input,
+    Tensor **out_grad_other,
+    Node **out_node
+) {
+    __create_node(node_type, op, dim1, dim2, bypass_backward, other_parameter, other, prev_node, out_grad_input, out_grad_other, out_node);
 }
 
 void feedforward(
@@ -1130,31 +1316,6 @@ void feedforward(
                 node->next->input = node->output;
             }
         }
-
-        // /////////
-        // printf("Input:\n\n");
-        // print_info(node->input);
-        // printf("Other:\n\n");
-        // if (node->other) print_info(node->other);
-
-        // if (node->op == ct_add) printf("((((((((((+))))))))))\n\n");
-        // if (node->op == ct_sub) printf("((((((((((-))))))))))\n\n");
-        // if (node->op == ct_mul) printf("((((((((((x))))))))))\n\n");
-        // if (node->op == ct_pow) printf("((((((((((^))))))))))\n\n");
-        // if (node->op == ct_div) printf("((((((((((/))))))))))\n\n");
-        // if (node->op == ct_neg) printf("((((((((((neg))))))))))\n\n");
-        // if (node->op == ct_tanh) printf("((((((((((tanh))))))))))\n\n");
-        // if (node->op == ct_tan) printf("((((((((((tan))))))))))\n\n");
-        // if (node->op == ct_abs) printf("((((((((((abs))))))))))\n\n");
-        // if (node->op == ct_relu) printf("((((((((((relu))))))))))\n\n");
-        // if (node->op == sum) printf("((((((((((sum))))))))))\n\n");
-        // if (node->op == matmul) printf("((((((((((@))))))))))\n\n");
-        // if (node->op == transpose_tensor) printf("((((((((((trans))))))))))\n\n");
-
-        // printf("Output:\n\n");
-        // print_info(node->output);
-        // printf("===>>>\n\n");
-        // /////////
         
         node = node->next;
     }
@@ -1203,6 +1364,51 @@ void backward(Node *node) {
             }
         }
 
+        // Let's check for broadcasting and reduce the broadcasted dims
+        if (node->input && node->grad_input) {
+            Tensor *tmp_grad_input = NULL;
+            int max_dims = node->grad_input->dimensions;
+            // Fill in the shapes starting from the leftmost dimension
+            for (int i = 0; i < max_dims; i++) {
+                int dim_input = (i >= max_dims - node->input->dimensions) ? node->input->shape[i - (max_dims - node->input->dimensions)] : 1;
+                int dim_grad_input = (i >= max_dims - node->grad_input->dimensions) ? node->grad_input->shape[i - (max_dims - node->grad_input->dimensions)] : 1;
+
+                // Determine the broadcasted dimension size
+                if (dim_input == 1 && dim_grad_input > 1) {
+                    operation(ct_sum, node->grad_input, NULL, i, -1, NULL, NULL, &tmp_grad_input);
+                    free_tensor(node->grad_input, true);
+                    deep_copy_tensor(tmp_grad_input, &node->grad_input);
+                    free_tensor(tmp_grad_input, true);
+                    max_dims = node->grad_input->dimensions;
+                }
+            }
+        }
+        if (node->other && node->grad_other) {
+            Tensor *tmp_grad_other = NULL;
+            int max_dims = node->grad_other->dimensions;
+            // Fill in the shapes starting from the leftmost dimension
+            for (int i = 0; i < max_dims; i++) {
+                int dim_other = (i >= max_dims - node->other->dimensions) ? node->other->shape[i - (max_dims - node->other->dimensions)] : 1;
+                int dim_grad_other = (i >= max_dims - node->grad_other->dimensions) ? node->grad_other->shape[i - (max_dims - node->grad_other->dimensions)] : 1;
+
+                // Determine the broadcasted dimension size
+                if (dim_other == 1 && dim_grad_other > 1) {
+                    operation(ct_sum, node->grad_other, NULL, i, -1, NULL, NULL, &tmp_grad_other);
+                    free_tensor(node->grad_other, true);
+                    deep_copy_tensor(tmp_grad_other, &node->grad_other);
+                    free_tensor(tmp_grad_other, true);
+                    max_dims = node->grad_other->dimensions;
+                }
+            }
+        }
+
+        if (node->retained_grad_input) {
+            *(node->retained_grad_input) = node->grad_input;
+        }
+        if (node->retained_grad_other) {
+            *(node->retained_grad_other) = node->grad_other;
+        }
+
         if (node->prev){
             if (node->prev->node_type == ONLY_OTHER) {
             node->prev->grad_output = node->grad_other;
@@ -1214,21 +1420,14 @@ void backward(Node *node) {
             node->prev->target = node->target;
         }
 
-        // /////////
-        // printf("Grad Output:\n\n");
-        // print_info(node->grad_output);
-        // printf("Grad Input:\n\n");
-        // print_info(node->grad_input);
-        // printf("Grad Other:\n\n");
-        // if (node->other) print_info(node->grad_other);
-        // printf("===>>>\n\n");
-        // /////////
-
         node = node->prev;
     }
 }
 
-void update_parameters(Node *node, Tensor *lr) {
+// Last step, which updates parameters
+void update_parameters(Node *last_node, Tensor *lr) {
+    Node *node = last_node;
+
     while (node) {
         if (node->other_parameter) {
             Tensor *delta = NULL;
@@ -1242,20 +1441,14 @@ void update_parameters(Node *node, Tensor *lr) {
     }
 }
 
-void free_graph(Node *node) {
-    //TODO:
-    while (node != NULL) {
-        Node *next_node = node->next;
-        
-        // Free the dynamically allocated output tensor
-        if (node->output != NULL) {
-            free(node->output);
-        }
+// Dispose the computational graph
+void dispose_graph(Node *last_node) {
+    Node *node = last_node;
 
-        // Free the node itself
-        free(node);
-        
-        node = next_node;
+    while (node) {
+        Node *prev_node = node->prev;
+        free_node(node);
+        node = prev_node;
     }
 }
 
@@ -1263,14 +1456,15 @@ void free_graph(Node *node) {
 
 typedef struct
 {
-    bool initiated;
-
     bool bias;
     int input_feature_size;
     int output_feature_size;
 
     Tensor *W;
     Tensor *b;
+
+    Tensor *grad_W;
+    Tensor *grad_b;
 
     Node *from_node;
     Node *to_node;
@@ -1282,45 +1476,44 @@ LinearLayer *linearlayer(
     bool bias
 ) {
     LinearLayer *ll = (LinearLayer *)malloc(sizeof(LinearLayer));
-
-    ll->initiated = false;
+    
     ll->bias = bias;
     ll->input_feature_size = input_feature_size;
     ll->output_feature_size = output_feature_size;
+
+    create_tensor((int[]) {ll->output_feature_size, ll->input_feature_size}, 2, &ll->W);
+    init_tensor_rand(1.0 / ll->input_feature_size, ll->W);
+
+    if (bias) {
+        create_tensor((int[]) {1, ll->output_feature_size}, 2, &ll->b);
+        init_tensor_rand(1.0 / ll->input_feature_size, ll->b);
+    }
 
     return ll;
 }
 
 void forward_linearlayer(
-    LinearLayer *io_ll,
+    LinearLayer *ll,
     Node *last_node,
     Tensor *X,
     Tensor **out_tensor
 ) {
-    if (io_ll->initiated == false) {
-        create_tensor((int[]) {io_ll->output_feature_size, io_ll->input_feature_size}, 2, &io_ll->W);
-        init_tensor_rand(1.0 / io_ll->input_feature_size, io_ll->W);
-        Node *W_T_node = NULL;
-        create_node(ONLY_OTHER, ct_transpose_tensor, 0, 1, false, true, io_ll->W, last_node, &W_T_node);
-        io_ll->from_node = W_T_node;
+    Node *W_T_node = NULL;
+    create_node_retain_grad(ONLY_OTHER, ct_transpose_tensor, 0, 1, false, true, ll->W, last_node, NULL, &ll->grad_W, &W_T_node);
+    ll->from_node = W_T_node;
 
-        Node *X_W_T_node = NULL;
-        create_node(INPUT_OTHER, ct_matmul, 0, 1, false, false, NULL, W_T_node, &X_W_T_node);
+    Node *X_W_T_node = NULL;
+    create_node(INPUT_OTHER, ct_matmul, 0, 1, false, false, NULL, W_T_node, &X_W_T_node);
 
-        if (io_ll->bias == true) {
-            create_tensor((int[]) {X->shape[0], io_ll->output_feature_size}, 2, &io_ll->b);
-            init_tensor_rand(1.0 / io_ll->input_feature_size, io_ll->b);
-            Node *b_node = NULL;
-            create_node(INPUT_OTHER, ct_add, 0, 1, false, true, io_ll->b, X_W_T_node, &b_node);
-            io_ll->to_node = b_node;
-        } else {
-            io_ll->to_node = X_W_T_node;
-        }
-        
-        io_ll->initiated = true;
+    if (ll->bias == true) {
+        Node *b_node = NULL;
+        create_node_retain_grad(INPUT_OTHER, ct_add, 0, 1, false, true, ll->b, X_W_T_node, NULL, &ll->grad_b, &b_node);
+        ll->to_node = b_node;
+    } else {
+        ll->to_node = X_W_T_node;
     }
     
-    feedforward(X, io_ll->from_node, io_ll->to_node, out_tensor);
+    feedforward(X, ll->from_node, ll->to_node, out_tensor);
 }
 
 void free_linearlayer(LinearLayer *ll) {
@@ -1330,12 +1523,11 @@ void free_linearlayer(LinearLayer *ll) {
 
 /////////////////////////////////////////////////////////////////////
 
-typedef struct
-{
-    bool initiated;
-
+typedef struct {
     void *op;
     int dim;
+
+    Tensor *grad_x;
 
     Node *from_node;
     Node *to_node;
@@ -1348,7 +1540,6 @@ ActivationLayer *activation_layer(
     ActivationLayer *al = (ActivationLayer *)malloc(sizeof(ActivationLayer));
     al->op = op;
     al->dim = dim;
-    al->initiated = false;
 
     return al;
 }
@@ -1359,14 +1550,10 @@ void forward_activationlayer(
     Tensor *X,
     Tensor **out_tensor
 ) {
-    if (!al->initiated) {
-        Node *act_node = NULL;
-        create_node(ONLY_INPUT, al->op, al->dim, 1, false, false, NULL, last_node, &act_node);
-        al->from_node = act_node;
-        al->to_node = act_node;
-
-        al->initiated = true;
-    }
+    Node *act_node = NULL;
+    create_node(ONLY_INPUT, al->op, al->dim, 1, false, false, NULL, last_node, &act_node);
+    al->from_node = act_node;
+    al->to_node = act_node;
 
     feedforward(X, al->from_node, al->to_node, out_tensor);
 }
@@ -1378,8 +1565,6 @@ void free_activationlayer(ActivationLayer *activationlayer) {
 /////////////////////////////////////////////////////////////////////
 
 typedef struct {
-    bool initiated;
-
     Tensor *c;
     Tensor *two;
 
@@ -1387,14 +1572,10 @@ typedef struct {
     Node *to_node;
 } MSELoss;
 
-MSELoss *mseloss(
-    int N
-) {
+MSELoss *mseloss() {
     MSELoss *mseloss = (MSELoss *)malloc(sizeof(MSELoss));
-
-    mseloss->initiated = false;
     
-    create_tensor_from_scalar(1.0 / N, &mseloss->c);
+    create_tensor_from_scalar(1.0, &mseloss->c);
     create_tensor_from_scalar(2.0, &mseloss->two);
 
     return mseloss;
@@ -1407,25 +1588,22 @@ void forward_mseloss(
     Tensor *target,
     Tensor **out_tensor
 ) {
-    if (!mseloss->initiated) {
-        Node *sub_node = NULL;
-        create_node(INPUT_OTHER, ct_sub, 0, 1, false, false, target, last_node, &sub_node);
-        mseloss->from_node = sub_node;
+    Node *sub_node = NULL;
+    create_node(INPUT_OTHER, ct_sub, 0, 1, false, false, target, last_node, &sub_node);
+    mseloss->from_node = sub_node;
 
-        Node *sub_pow_node = NULL;
-        create_node(INPUT_OTHER, ct_pow, 0, 1, false, false, mseloss->two, sub_node, &sub_pow_node);
+    Node *sub_pow_node = NULL;
+    create_node(INPUT_OTHER, ct_pow, 0, 1, false, false, mseloss->two, sub_node, &sub_pow_node);
 
-        Node *sub_pow_mul_node = NULL;
-        create_node(INPUT_OTHER, ct_mul, 0, 1, false, false, mseloss->c, sub_pow_node, &sub_pow_mul_node);
+    Node *sub_pow_mul_node = NULL;
+    mseloss->c->data[0] = 1.0 / (X->shape[0] * X->shape[1]);
+    create_node(INPUT_OTHER, ct_mul, 0, 1, false, false, mseloss->c, sub_pow_node, &sub_pow_mul_node);
 
-        Node *sub_pow_mul_sum_node = NULL;
-        create_node(ONLY_INPUT, ct_sum, 0, 1, false, false, NULL, sub_pow_mul_node, &sub_pow_mul_sum_node);
-        mseloss->to_node = sub_pow_mul_sum_node;
+    Node *sub_pow_mul_sum_node = NULL;
+    create_node(ONLY_INPUT, ct_sum, -1, 1, false, false, NULL, sub_pow_mul_node, &sub_pow_mul_sum_node);
+    mseloss->to_node = sub_pow_mul_sum_node;
 
-        mseloss->to_node->target = target;
-
-        mseloss->initiated = true;
-    }
+    mseloss->to_node->target = target;
 
     feedforward(X, mseloss->from_node, mseloss->to_node, out_tensor);
 }
@@ -1437,22 +1615,16 @@ void free_mseloss(MSELoss *mseloss) {
 }
 
 typedef struct {
-    bool initiated;
-
     Tensor *c;
 
     Node *from_node;
     Node *to_node;
 } NLLLoss;
 
-NLLLoss *nllloss(
-    int N
-) {
+NLLLoss *nllloss() {
     NLLLoss *nllloss = (NLLLoss *)malloc(sizeof(NLLLoss));
-
-    nllloss->initiated = false;
     
-    create_tensor_from_scalar(-1.0 / N, &nllloss->c);
+    create_tensor_from_scalar(1.0, &nllloss->c);
 
     return nllloss;
 }
@@ -1464,25 +1636,26 @@ void forward_nllloss(
     Tensor *target,
     Tensor **out_tensor
 ) {
-    if (!nllloss->initiated) {
-        Node *log_node = NULL;
-        create_node(ONLY_INPUT, ct_log, 0, 1, true, false, NULL, last_node, &log_node);
-        nllloss->from_node = log_node;
+    Node *log_node = NULL;
+    create_node(ONLY_INPUT, ct_log, 0, 1, true, false, NULL, last_node, &log_node);
+    nllloss->from_node = log_node;
 
-        Node *log_mul_node = NULL;
-        create_node(INPUT_OTHER, ct_mul, 0, 1, true, false, target, log_node, &log_mul_node);
+    Node *log_mul_node = NULL;
+    create_node(INPUT_OTHER, ct_mul, 0, 1, true, false, target, log_node, &log_mul_node);
 
-        Node *log_mul_sum_node = NULL;
-        create_node(ONLY_INPUT, ct_sum, 0, 1, false, false, NULL, log_mul_node, &log_mul_sum_node);
+    Node *log_mul_sum_node = NULL;
+    create_node(ONLY_INPUT, ct_sum, -1, 1, false, false, NULL, log_mul_node, &log_mul_sum_node);
 
-        Node *log_mul_sum_mul_node = NULL;
-        create_node(INPUT_OTHER, ct_mul, 0, 1, false, false, nllloss->c, log_mul_sum_node, &log_mul_sum_mul_node);
-        nllloss->to_node = log_mul_sum_mul_node;
+    Node *log_mul_sum_mul_node = NULL;
+    nllloss->c->data[0] = 1.0 / (X->shape[0]);
+    create_node(INPUT_OTHER, ct_mul, 0, 1, false, false, nllloss->c, log_mul_sum_node, &log_mul_sum_mul_node);
+    
+    Node *log_mul_sum_mul_neg_node = NULL;
+    nllloss->c->data[0] = 1.0 / (X->shape[0]);
+    create_node(INPUT_OTHER, ct_neg, 0, 1, true, false, NULL, log_mul_sum_mul_node, &log_mul_sum_mul_neg_node);
+    nllloss->to_node = log_mul_sum_mul_neg_node;
 
-        nllloss->to_node->target = target;
-
-        nllloss->initiated = true;
-    }
+    nllloss->to_node->target = target;
 
     feedforward(X, nllloss->from_node, nllloss->to_node, out_tensor);
 }
@@ -1493,8 +1666,6 @@ void free_nllloss(NLLLoss *nllloss) {
 }
 
 typedef struct {
-    bool initiated;
-
     ActivationLayer *softmax;
     NLLLoss *nllloss;
 
@@ -1508,9 +1679,7 @@ CrossEntropyLoss *crossentropyloss(
 ) {
     CrossEntropyLoss *crossentropyloss = (CrossEntropyLoss *)malloc(sizeof(CrossEntropyLoss));
     crossentropyloss->softmax = activation_layer(ct_softmax, dim);
-    crossentropyloss->nllloss = nllloss(N);
-
-    crossentropyloss->initiated = false;
+    crossentropyloss->nllloss = nllloss();
 
     return crossentropyloss;
 }
@@ -1526,12 +1695,8 @@ void forward_crossentropyloss(
     forward_activationlayer(crossentropyloss->softmax, last_node, X, &y1);
     forward_nllloss(crossentropyloss->nllloss, crossentropyloss->softmax->to_node, y1, target, out_tensor);
 
-    if (!crossentropyloss->initiated) {
-        crossentropyloss->from_node = crossentropyloss->softmax->from_node;
-        crossentropyloss->to_node = crossentropyloss->nllloss->to_node;
-
-        crossentropyloss->initiated = true;
-    }
+    crossentropyloss->from_node = crossentropyloss->softmax->from_node;
+    crossentropyloss->to_node = crossentropyloss->nllloss->to_node;
 }
 
 void free_crossentropyloss(NLLLoss *nllloss) {
@@ -1540,9 +1705,6 @@ void free_crossentropyloss(NLLLoss *nllloss) {
 }
 
 /////////////////////////////////////////////////////////////////////
-
-#define NUM_IMAGES 20000  // Adjust this number if your dataset size differs
-#define IMAGE_SIZE 784    // Each image has 28x28 pixels
 
 typedef struct {
     LinearLayer *ll1;
@@ -1579,7 +1741,7 @@ void mnistarch(int in_feature_size, int out_feature_size, int batch_size, MNISTA
     (*out_arch)->ll4 = linearlayer(hidden_size3, out_feature_size, true);   // Hidden Layer 2 -> Hidden Layer 3
     (*out_arch)->sm  = activation_layer(ct_softmax, 1);                     // Softmax
 
-    (*out_arch)->loss = nllloss(batch_size);                                // NLLLoss
+    (*out_arch)->loss = nllloss();                                          // NLLLoss
 }
 
 void mnistforwad(MNISTArch *arch, Tensor *X, Tensor **y_pred) {
@@ -1637,18 +1799,17 @@ void load_mnist_dataset(
         (*out_mnist_labels)[image_idx] = atoi(token);
 
         // Read the next 784 tokens for pixel values
-        for (int i = 0; i < IMAGE_SIZE; i++) {
+        for (int i = 0; i < image_size; i++) {
             token = strtok(NULL, ",");
             if (token != NULL) {
-                double transformed_pixel = atof(token) / 255.0; // Transform pixel [0, 255] -> [0, 1.0]
-                (*out_mnist_images)[image_idx][i] =  (transformed_pixel - 0.5) / 0.5; // Normalize pixel value
+                (*out_mnist_images)[image_idx][i] =  atof(token) / 255.0; // Transform pixel [0, 255] -> [0, 1.0]
             }
         }
 
         image_idx++;
 
         // Stop if we have loaded enough images (for small datasets)
-        if (image_idx >= NUM_IMAGES) {
+        if (image_idx >= num_images) {
             break;
         }
     }
@@ -1656,70 +1817,89 @@ void load_mnist_dataset(
     fclose(file);
 }
 
+void free_mnist_dataset(
+    int num_images,
+    int image_size,
+    double **mnist_images,
+    int *mnist_labels
+) {
+    for (int i = 0; i < num_images; i++) {
+        free(mnist_images[i]);
+        mnist_images[i] = NULL;
+    }
+    free(mnist_images);
+    mnist_images = NULL;
+
+    free(mnist_labels);
+    mnist_labels = NULL;
+}
+
 // Function to load a batch of MNIST data into tensors X and Y
 void load_mnist_batch(
-    Tensor *io_X,
-    Tensor *io_Y,
     double **mnist_images,
     int *mnist_labels,
+    int dataset_size,
     int batch_idx,
-    int batch_size
+    int batch_size,
+    Tensor **out_X,
+    Tensor **out_Y
 ) {
     int start_idx = batch_idx * batch_size;
+    int actual_batch_size = (start_idx + batch_size < dataset_size) ? batch_size : dataset_size - (start_idx + 1);
+
+    create_tensor((int[2]){actual_batch_size, 784}, 2, out_X);  // Create (batch_size, 784) tensor
+    create_tensor((int[2]){actual_batch_size,  10}, 2, out_Y);  // Create (batch_size, 10) tensor
 
     // Loop through the batch
-    for (int i = 0; i < batch_size; i++) {
-        int data_idx = start_idx + i;
+    for (int i = 0; i < actual_batch_size; i++) {
+        int src_idx = start_idx + i + 1;
 
         // Load the image and flatten it into a 784-length vector
         for (int j = 0; j < 784; j++) {
-            set_element(io_X, mnist_images[data_idx][j], i, j);  // Normalize the pixel value
+            set_element(*out_X, mnist_images[src_idx][j], i, j);
         }
 
         // Load the label and one-hot encode it into a 10-length vector
         double one_hot_label[10] = {0};
         for (int i = 0; i < 10; i++) {
-            one_hot_label[i] = (i == mnist_labels[data_idx]) ? 1.0 : 0.0;
+            one_hot_label[i] = (i == mnist_labels[src_idx]) ? 1.0 : 0.0;
         }
 
         for (int j = 0; j < 10; j++) {
-            set_element(io_Y, one_hot_label[j], i, j);
+            set_element(*out_Y, one_hot_label[j], i, j);
         }
     }
 }
 
-void mnist_test(
-    const char *mnist_csv_file
+void mnist_train(
+    const char *mnist_train_csv_file
 ) {
     double **mnist_images = NULL;
     int *mnist_labels = NULL;
 
+    int dataset_size = 20000;   // Adjust dataset size
+    int image_size = 784;       // Flattened MNIST image (28 * 28)
+    int label_size = 10;        // MNIST has 10 classes (digits 0-9)
+
     // Load the MNIST dataset from the CSV file
-    load_mnist_dataset(mnist_csv_file, NUM_IMAGES, IMAGE_SIZE, &mnist_images, &mnist_labels);
+    load_mnist_dataset(mnist_train_csv_file, dataset_size, image_size, &mnist_images, &mnist_labels);
 
     // Define hyperparameters
-    int training_size = 20000;
+    int training_size = dataset_size;
     int batch_size = 64;
     int num_batches = ceil(training_size * 1.0 / batch_size);   // Number of batches in the epoch (adjust accordingly)
-    int num_batches_to_print = 312;                             // Number of batches in the epoch to print result
+    int num_batches_to_print = 100;                             // Number of batches in the epoch to print result
     int epoch = 10;
-    double lr = 0.1;       // Learning rate
+    double lr = 0.1;    // Learning rate
 
     // Define DNN architecture: 784 -> 512 -> 128 -> 10
-    int input_size = 784;  // Flattened MNIST image (28 * 28)
-    int output_size = 10;  // MNIST has 10 classes (digits 0-9)
-
-    // Placeholder for batch input and labels
-    int X_shape[] = {batch_size, input_size};
-    int Y_shape[] = {batch_size, output_size};
-    Tensor *X = NULL, *Y = NULL;
-    create_tensor(X_shape, 2, &X);  // Create (batch_size, 784) tensor
-    create_tensor(Y_shape, 2, &Y);  // Create (batch_size, 10) tensor
+    int input_size = image_size;
+    int output_size = label_size;
 
     Tensor *tensor_lr = NULL;
     create_tensor_from_scalar(lr, &tensor_lr);  // Learning rate as a scalar tensor
 
-    // Initialize DNN layers
+    // Create DNN layers
     MNISTArch *arch = NULL;
     mnistarch(input_size, output_size, batch_size, &arch);
 
@@ -1727,12 +1907,15 @@ void mnist_test(
     // You will need to implement this function or load the data accordingly.
     
     for (int e = 1; e <= epoch; e++) {
-        printf("Epoch: %d/%d\n", e, epoch);
+        printf("Epoch: %d/%d\n\n", e, epoch);
         
         double accumulated_epoch_loss = 0.0;
         for (int b = 0; b < num_batches; b++) {
+            // Placeholder for batch input and labels
+            Tensor *X = NULL, *Y = NULL;
+
             // Load a batch of data (X, Y)
-            load_mnist_batch(X, Y, mnist_images, mnist_labels, b, batch_size);
+            load_mnist_batch(mnist_images, mnist_labels, training_size, b, batch_size, &X, &Y);
 
             // Forward pass through the DNN
             Tensor *y_pred = NULL;
@@ -1750,14 +1933,110 @@ void mnist_test(
             update_parameters(arch->loss->to_node, tensor_lr);
 
             // Print the loss
-            // if ((b + 1) % num_batches_to_print == 0) {
-            //     printf("Batch %d/%d - Loss:\n", b + 1, num_batches);
-            //     print_info(out_loss);  // Print the loss tensor
-            //     printf("-------------------\n");
-            // }
+            if ((b + 1) % num_batches_to_print == 0) {
+                printf("Batch %d/%d - Loss: %.4f\n\n", b + 1, num_batches, accumulated_epoch_loss / (b + 1.0));
+            }
+
+            // Dispose computational graph and other stuff
+            dispose_graph(arch->loss->to_node);
+            free_tensor(X, true);
+            free_tensor(Y, true);
         }
-        printf("%.16f\n\n", accumulated_epoch_loss);
+        
+        printf("Total Averaged Loss: %.4f\n", accumulated_epoch_loss / (num_batches * 1.0));
+        printf("-------------------\n\n");
+
+        if (e % 3 == 0) {
+            // Decay learning rate
+            tensor_lr->data[0] /= 10;
+            
+            // Store parameters in proper files
+            char filename[50];
+            
+            sprintf(filename, "./chckpts/checkpoint_%d_ll1_W.txt", e);
+            store_tensor(filename, arch->ll1->W, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll1_b.txt", e);
+            store_tensor(filename, arch->ll1->b, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll2_b.txt", e);
+            store_tensor(filename, arch->ll2->b, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll2_W.txt", e);
+            store_tensor(filename, arch->ll2->W, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll3_b.txt", e);
+            store_tensor(filename, arch->ll3->b, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll3_W.txt", e);
+            store_tensor(filename, arch->ll3->W, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll4_b.txt", e);
+            store_tensor(filename, arch->ll4->b, 16);
+            sprintf(filename, "./chckpts/checkpoint_%d_ll4_W.txt", e);
+            store_tensor(filename, arch->ll4->W, 16);
+        }
     }
+    
+    free_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
+}
+
+void mnist_eval(
+    const char *mnist_eval_csv_file
+) {
+    double **mnist_images = NULL;
+    int *mnist_labels = NULL;
+
+    int dataset_size = 10000;   // Adjust dataset size
+    int image_size = 784;       // Flattened MNIST image (28 * 28)
+    int label_size = 10;        // MNIST has 10 classes (digits 0-9)
+
+    // Load the MNIST dataset from the CSV file
+    load_mnist_dataset(mnist_eval_csv_file, dataset_size, image_size, &mnist_images, &mnist_labels);
+
+    // Define hyperparameters
+    int eval_size = dataset_size;
+    int batch_size = 64;
+    int num_batches = ceil(eval_size * 1.0 / batch_size);   // Number of batches in the epoch (adjust accordingly)
+
+    // Define DNN architecture: 784 -> 512 -> 128 -> 10
+    int input_size = image_size;
+    int output_size = label_size;
+
+    // Create DNN layers
+    MNISTArch *arch = NULL;
+    mnistarch(input_size, output_size, batch_size, &arch);
+
+    // Initialize DNN from the stored parameters
+    load_tensor("./chckpts/checkpoint_9_ll1_W.txt", arch->ll1->W);
+    load_tensor("./chckpts/checkpoint_9_ll1_b.txt", arch->ll1->b);
+    load_tensor("./chckpts/checkpoint_9_ll2_W.txt", arch->ll2->W);
+    load_tensor("./chckpts/checkpoint_9_ll2_b.txt", arch->ll2->b);
+    load_tensor("./chckpts/checkpoint_9_ll3_W.txt", arch->ll3->W);
+    load_tensor("./chckpts/checkpoint_9_ll3_b.txt", arch->ll3->b);
+    load_tensor("./chckpts/checkpoint_9_ll4_W.txt", arch->ll4->W);
+    load_tensor("./chckpts/checkpoint_9_ll4_b.txt", arch->ll4->b);
+
+    double accumulated_epoch_loss = 0.0;
+    for (int b = 0; b < num_batches; b++) {
+        // Placeholder for batch input and labels
+        Tensor *X = NULL, *Y = NULL;
+
+        // Load a batch of data (X, Y)
+        load_mnist_batch(mnist_images, mnist_labels, eval_size, b, batch_size, &X, &Y);
+
+        // Forward pass through the DNN
+        Tensor *y_pred = NULL;
+        mnistforwad(arch, X, &y_pred);
+
+        // Loss calculation
+        Tensor *out_loss = NULL;
+        mnistloss(arch, y_pred, Y, &out_loss);
+        accumulated_epoch_loss += out_loss->data[0];
+
+        // Dispose computational graph and other stuff
+        dispose_graph(arch->loss->to_node);
+        free_tensor(X, true);
+        free_tensor(Y, true);
+    }
+    
+    printf("Total Averaged Loss: %.4f\n", accumulated_epoch_loss / (num_batches * 1.0));
+    
+    free_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1777,11 +2056,11 @@ void simplearch(int input_size, int output_size, int batch_size, SimpleArch **ou
     *out_arch = (SimpleArch *)malloc(sizeof(SimpleArch));
 
     // Initialize DNN layers
-    (*out_arch)->ll1 = linearlayer(input_size, 1, false);
-    (*out_arch)->ll2 = linearlayer(1, output_size, false);
+    (*out_arch)->ll1 = linearlayer(input_size, 1, true);
+    (*out_arch)->ll2 = linearlayer(1, output_size, true);
     (*out_arch)->al  = activation_layer(ct_pow2, -1);
 
-    (*out_arch)->loss = mseloss(output_size * batch_size);
+    (*out_arch)->loss = mseloss();
 }
 
 void simpleforwad(SimpleArch *arch, Tensor *X, Tensor **y_pred) {
@@ -1935,9 +2214,12 @@ void simple_test() {
                 printf("W2:\n");
                 print_info(arch->ll2->W);
                 printf("Loss:\n");
-                print_info(out_loss);  // Print the loss tensor
+                print_info_with_precision(out_loss, 16);  // Print the loss tensor
                 printf("-------------------\n");
             }
+
+            // Dispose computational graph
+            dispose_graph(arch->loss->to_node);
         }
     }
 }
@@ -2004,9 +2286,11 @@ int main(
     int argc,
     char *argv[]
 ) {
-    setup_application(-1);
+    setup_application(42);
 
-    mnist_test("./mnist_train_small.csv");
+    // mnist_train("./mnist_train_small.csv");
+    // mnist_eval("./mnist_test.csv");
+
     // simple_test();
     // simple_test2();
 
