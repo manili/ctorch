@@ -43,7 +43,7 @@ void calculate_strides(
 }
 
 // Function to free the tensor's memory
-void free_tensor(
+void dispose_tensor(
     Tensor *tensor,
     bool free_data
 ) {
@@ -1011,8 +1011,8 @@ void ct_matmul(
 
     // Free allocated memory
     free(out_shape);
-    free_tensor(broadcasted_a, true);
-    free_tensor(broadcasted_b, true);
+    dispose_tensor(broadcasted_a, true);
+    dispose_tensor(broadcasted_b, true);
 }
 
 // Function to transpose a tensor by swapping two dimensions
@@ -1124,8 +1124,8 @@ void operation(
             }
 
             // Free broadcasted tensors
-            free_tensor(broadcasted_a, true);
-            free_tensor(broadcasted_b, true);
+            dispose_tensor(broadcasted_a, true);
+            dispose_tensor(broadcasted_b, true);
         }
     } else {
         // Handle the default error case
@@ -1171,24 +1171,28 @@ typedef struct Node {
     struct Node *prev;
 } Node;
 
-void free_node(Node *node) {
+void dispose_node(Node *node) {
     if (node == NULL) return;
 
     // Free all associated Tensors, checking if they exist
     bool data_dispose = node->op != ct_transpose_tensor;
 
     if (node->output) {
-        free_tensor(node->output, data_dispose);
+        dispose_tensor(node->output, data_dispose);
         node->output = NULL;
     }
     
-    if (node->grad_input && (node->node_type == ONLY_INPUT || node->node_type == INPUT_OTHER)) {
-        free_tensor(node->grad_input, data_dispose);
+    if (node->grad_input &&
+        !node->bypass_backward && node->op != ct_softmax &&
+        (node->node_type == ONLY_INPUT || node->node_type == INPUT_OTHER)) {
+        dispose_tensor(node->grad_input, data_dispose);
         node->grad_input = NULL;
     }
     
-    if (node->grad_other && (node->node_type == ONLY_OTHER || node->node_type == INPUT_OTHER)) {
-        free_tensor(node->grad_other, data_dispose);
+    if (node->grad_other &&
+        !node->bypass_backward && node->op != ct_softmax &&
+        (node->node_type == ONLY_OTHER || node->node_type == INPUT_OTHER)) {
+        dispose_tensor(node->grad_other, data_dispose);
         node->grad_other = NULL;
     }
 
@@ -1333,13 +1337,14 @@ void backward(Node *node) {
 
     while (node) {
         if (node->bypass_backward) {
-            // Note that grad_output MUST have the same shape as grad_input or grad_other
-            deep_copy_tensor(node->grad_output, &node->grad_input);
-            deep_copy_tensor(node->grad_output, &node->grad_other);
+            // Note that grad_output MUST have the same shape as grad_input and grad_other
+            node->grad_input = node->grad_output;
+            node->grad_other = node->grad_output;
         } else if (node->op == ct_softmax) {
             Tensor *grad_input_tmp = NULL;
             operation(ct_sub, node->output, node->target, node->dim1, node->dim2, NULL, NULL, &grad_input_tmp);
             operation(ct_mul, node->grad_output, grad_input_tmp, node->dim1, node->dim2, NULL, NULL, &node->grad_input);
+            dispose_tensor(grad_input_tmp, true);
         } else if (node->op == ct_matmul) {
             Tensor *input_T = NULL;
             Tensor *other_T = NULL;
@@ -1347,6 +1352,8 @@ void backward(Node *node) {
             ct_transpose_tensor(node->other, node->dim1, node->dim2, &other_T);
             operation(ct_matmul, node->grad_output, other_T, node->dim1, node->dim2, NULL, NULL, &node->grad_input);
             operation(ct_matmul, input_T, node->grad_output, node->dim1, node->dim2, NULL, NULL, &node->grad_other);
+            dispose_tensor(input_T, false);
+            dispose_tensor(other_T, false);
         } else if (node->op == ct_transpose_tensor) {
             if (node->node_type == ONLY_INPUT) {
                 ct_transpose_tensor(node->grad_output, node->dim1, node->dim2, &node->grad_input);
@@ -1357,10 +1364,12 @@ void backward(Node *node) {
             Tensor *grad_input_tmp = NULL;
             operation(ct_mul, node->grad_input, node->grad_output, node->dim1, node->dim2, NULL, NULL, &grad_input_tmp);
             memcpy(node->grad_input->data, grad_input_tmp->data, grad_input_tmp->total_size * sizeof(double));
+            dispose_tensor(grad_input_tmp, true);
             if (node->grad_other) {
                 Tensor *grad_other_tmp = NULL;
                 operation(ct_mul, node->grad_other, node->grad_output, node->dim1, node->dim2, NULL, NULL, &grad_other_tmp);
                 memcpy(node->grad_other->data, grad_other_tmp->data, grad_other_tmp->total_size * sizeof(double));
+                dispose_tensor(grad_other_tmp, true);
             }
         }
 
@@ -1376,9 +1385,9 @@ void backward(Node *node) {
                 // Determine the broadcasted dimension size
                 if (dim_input == 1 && dim_grad_input > 1) {
                     operation(ct_sum, node->grad_input, NULL, i, -1, NULL, NULL, &tmp_grad_input);
-                    free_tensor(node->grad_input, true);
+                    dispose_tensor(node->grad_input, true);
                     deep_copy_tensor(tmp_grad_input, &node->grad_input);
-                    free_tensor(tmp_grad_input, true);
+                    dispose_tensor(tmp_grad_input, true);
                     max_dims = node->grad_input->dimensions;
                 }
             }
@@ -1394,9 +1403,9 @@ void backward(Node *node) {
                 // Determine the broadcasted dimension size
                 if (dim_other == 1 && dim_grad_other > 1) {
                     operation(ct_sum, node->grad_other, NULL, i, -1, NULL, NULL, &tmp_grad_other);
-                    free_tensor(node->grad_other, true);
+                    dispose_tensor(node->grad_other, true);
                     deep_copy_tensor(tmp_grad_other, &node->grad_other);
-                    free_tensor(tmp_grad_other, true);
+                    dispose_tensor(tmp_grad_other, true);
                     max_dims = node->grad_other->dimensions;
                 }
             }
@@ -1435,6 +1444,8 @@ void update_parameters(Node *last_node, Tensor *lr) {
             operation(ct_mul, lr, node->grad_other, node->dim1, node->dim2, NULL, NULL, &delta);
             operation(ct_sub, node->other, delta, node->dim1, node->dim2, NULL, NULL, &other_tmp);
             memcpy(node->other->data, other_tmp->data, other_tmp->total_size * sizeof(double));
+            dispose_tensor(delta, true);
+            dispose_tensor(other_tmp, true);
         }
 
         node = node->prev;
@@ -1445,9 +1456,12 @@ void update_parameters(Node *last_node, Tensor *lr) {
 void dispose_graph(Node *last_node) {
     Node *node = last_node;
 
+    dispose_tensor(node->grad_other, true);
+    node->grad_other = NULL;
+
     while (node) {
         Node *prev_node = node->prev;
-        free_node(node);
+        dispose_node(node);
         node = prev_node;
     }
 }
@@ -1516,9 +1530,10 @@ void forward_linearlayer(
     feedforward(X, ll->from_node, ll->to_node, out_tensor);
 }
 
-void free_linearlayer(LinearLayer *ll) {
-    free_tensor(ll->W, true);
-    if (ll->bias) free_tensor(ll->b, true);
+void dispose_linearlayer(LinearLayer *ll) {
+    dispose_tensor(ll->W, true); ll->W = NULL;
+    if (ll->bias) dispose_tensor(ll->b, true); ll->b = NULL;
+    free(ll);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1558,7 +1573,7 @@ void forward_activationlayer(
     feedforward(X, al->from_node, al->to_node, out_tensor);
 }
 
-void free_activationlayer(ActivationLayer *activationlayer) {
+void dispose_activationlayer(ActivationLayer *activationlayer) {
     free(activationlayer);
 }
 
@@ -1608,9 +1623,9 @@ void forward_mseloss(
     feedforward(X, mseloss->from_node, mseloss->to_node, out_tensor);
 }
 
-void free_mseloss(MSELoss *mseloss) {
-    free_tensor(mseloss->two, true);
-    free_tensor(mseloss->c, true);
+void dispose_mseloss(MSELoss *mseloss) {
+    dispose_tensor(mseloss->two, true); mseloss->two = NULL;
+    dispose_tensor(mseloss->c, true); mseloss->c = NULL;
     free(mseloss);
 }
 
@@ -1660,8 +1675,8 @@ void forward_nllloss(
     feedforward(X, nllloss->from_node, nllloss->to_node, out_tensor);
 }
 
-void free_nllloss(NLLLoss *nllloss) {
-    free_tensor(nllloss->c, true);
+void dispose_nllloss(NLLLoss *nllloss) {
+    dispose_tensor(nllloss->c, true); nllloss->c = NULL;
     free(nllloss);
 }
 
@@ -1699,9 +1714,10 @@ void forward_crossentropyloss(
     crossentropyloss->to_node = crossentropyloss->nllloss->to_node;
 }
 
-void free_crossentropyloss(NLLLoss *nllloss) {
-    free_tensor(nllloss->c, true);
-    free(nllloss);
+void dispose_crossentropyloss(CrossEntropyLoss *crossentropyloss) {
+    dispose_activationlayer(crossentropyloss->softmax); crossentropyloss->softmax = NULL;
+    dispose_nllloss(crossentropyloss->nllloss); crossentropyloss->nllloss = NULL;
+    free(crossentropyloss);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -1719,29 +1735,37 @@ typedef struct {
     NLLLoss *loss;
 } MNISTArch;
 
-void mnistarch(int in_feature_size, int out_feature_size, int batch_size, MNISTArch **out_arch) {
+void create_mnistarch(int in_feature_size, int out_feature_size, int batch_size, MNISTArch **out_arch) {
     *out_arch = (MNISTArch *)malloc(sizeof(MNISTArch));
 
     int hidden_size1 = 512;
     int hidden_size2 = 256;
     int hidden_size3 = 128;
 
-
     // Initialize DNN layers
     (*out_arch)->ll1 = linearlayer(in_feature_size, hidden_size1, true);    // Input -> Hidden Layer 1
     (*out_arch)->al1 = activation_layer(ct_relu, -1);                       // Activation after Layer 1
-
     (*out_arch)->ll2 = linearlayer(hidden_size1, hidden_size2, true);       // Hidden Layer 1 -> Hidden Layer 2
     (*out_arch)->al2 = activation_layer(ct_relu, -1);                       // Activation after Layer 2
-
     (*out_arch)->ll3 = linearlayer(hidden_size2, hidden_size3, true);       // Hidden Layer 2 -> Hidden Layer 3
     (*out_arch)->al3 = activation_layer(ct_relu, -1);                       // Activation after Layer 3
-
-
     (*out_arch)->ll4 = linearlayer(hidden_size3, out_feature_size, true);   // Hidden Layer 2 -> Hidden Layer 3
     (*out_arch)->sm  = activation_layer(ct_softmax, 1);                     // Softmax
 
     (*out_arch)->loss = nllloss();                                          // NLLLoss
+}
+
+void dispose_mnistarch(MNISTArch *out_arch) {
+    dispose_linearlayer(out_arch->ll1);
+    dispose_activationlayer(out_arch->al1);
+    dispose_linearlayer(out_arch->ll2);
+    dispose_activationlayer(out_arch->al2);
+    dispose_linearlayer(out_arch->ll3);
+    dispose_activationlayer(out_arch->al3);
+    dispose_linearlayer(out_arch->ll4);
+    dispose_activationlayer(out_arch->sm);
+
+    dispose_nllloss(out_arch->loss);
 }
 
 void mnistforwad(MNISTArch *arch, Tensor *X, Tensor **y_pred) {
@@ -1817,7 +1841,7 @@ void load_mnist_dataset(
     fclose(file);
 }
 
-void free_mnist_dataset(
+void dispose_mnist_dataset(
     int num_images,
     int image_size,
     double **mnist_images,
@@ -1901,7 +1925,7 @@ void mnist_train(
 
     // Create DNN layers
     MNISTArch *arch = NULL;
-    mnistarch(input_size, output_size, batch_size, &arch);
+    create_mnistarch(input_size, output_size, batch_size, &arch);
 
     // Assume load_mnist_batch loads the MNIST batch of images and labels
     // You will need to implement this function or load the data accordingly.
@@ -1939,8 +1963,8 @@ void mnist_train(
 
             // Dispose computational graph and other stuff
             dispose_graph(arch->loss->to_node);
-            free_tensor(X, true);
-            free_tensor(Y, true);
+            dispose_tensor(X, true);
+            dispose_tensor(Y, true);
         }
         
         printf("Total Averaged Loss: %.4f\n", accumulated_epoch_loss / (num_batches * 1.0));
@@ -1972,7 +1996,8 @@ void mnist_train(
         }
     }
     
-    free_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
+    dispose_mnistarch(arch);
+    dispose_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
 }
 
 void mnist_eval(
@@ -1999,7 +2024,7 @@ void mnist_eval(
 
     // Create DNN layers
     MNISTArch *arch = NULL;
-    mnistarch(input_size, output_size, batch_size, &arch);
+    create_mnistarch(input_size, output_size, batch_size, &arch);
 
     // Initialize DNN from the stored parameters
     load_tensor("./chckpts/checkpoint_9_ll1_W.txt", arch->ll1->W);
@@ -2030,13 +2055,14 @@ void mnist_eval(
 
         // Dispose computational graph and other stuff
         dispose_graph(arch->loss->to_node);
-        free_tensor(X, true);
-        free_tensor(Y, true);
+        dispose_tensor(X, true);
+        dispose_tensor(Y, true);
     }
     
     printf("Total Averaged Loss: %.4f\n", accumulated_epoch_loss / (num_batches * 1.0));
     
-    free_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
+    dispose_mnistarch(arch);
+    dispose_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -2288,8 +2314,8 @@ int main(
 ) {
     setup_application(42);
 
-    // mnist_train("./mnist_train_small.csv");
-    // mnist_eval("./mnist_test.csv");
+    mnist_train("./mnist_train_small.csv");
+    mnist_eval("./mnist_test.csv");
 
     // simple_test();
     // simple_test2();
