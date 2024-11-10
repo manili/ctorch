@@ -150,9 +150,6 @@ void init_tensor_rand(
     }
 }
 
-#include <stdio.h>
-#include <stdlib.h>
-
 // Function to store tensor values in a file with specified precision
 void store_tensor(
     const char *filename,
