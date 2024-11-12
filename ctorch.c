@@ -114,17 +114,6 @@ void create_tensor_from_scalar(
     (*out_tensor)->data[0] = value;
 }
 
-void create_tensor_from_tensor(
-    Tensor *tensor,
-    int index,
-    Tensor **out_tensor
-) {
-    int new_tensor_shape[] = {1, 1};
-    create_tensor(new_tensor_shape, 2, out_tensor);
-    free((*out_tensor)->data);
-    (*out_tensor)->data = &tensor->data[index];
-}
-
 // Initialize all elements to default_vlaue
 void init_tensor(
     double default_vlaue,
