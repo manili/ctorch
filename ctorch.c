@@ -1721,7 +1721,7 @@ typedef struct {
     NLLLoss *loss;
 } MNISTArch;
 
-void create_mnistarch(int in_feature_size, int out_feature_size, int batch_size, MNISTArch **out_arch) {
+void create_mnistarch(int in_feature_size, int out_feature_size, MNISTArch **out_arch) {
     *out_arch = (MNISTArch *)malloc(sizeof(MNISTArch));
 
     int hidden_size1 = 512;
@@ -1741,17 +1741,17 @@ void create_mnistarch(int in_feature_size, int out_feature_size, int batch_size,
     (*out_arch)->loss = nllloss();                                          // NLLLoss
 }
 
-void dispose_mnistarch(MNISTArch *out_arch) {
-    dispose_linearlayer(out_arch->ll1);
-    dispose_activationlayer(out_arch->al1);
-    dispose_linearlayer(out_arch->ll2);
-    dispose_activationlayer(out_arch->al2);
-    dispose_linearlayer(out_arch->ll3);
-    dispose_activationlayer(out_arch->al3);
-    dispose_linearlayer(out_arch->ll4);
-    dispose_activationlayer(out_arch->sm);
+void dispose_mnistarch(MNISTArch *arch) {
+    dispose_linearlayer(arch->ll1);
+    dispose_activationlayer(arch->al1);
+    dispose_linearlayer(arch->ll2);
+    dispose_activationlayer(arch->al2);
+    dispose_linearlayer(arch->ll3);
+    dispose_activationlayer(arch->al3);
+    dispose_linearlayer(arch->ll4);
+    dispose_activationlayer(arch->sm);
 
-    dispose_nllloss(out_arch->loss);
+    dispose_nllloss(arch->loss);
 }
 
 void mnistforwad(MNISTArch *arch, Tensor *X, Tensor **y_pred) {
@@ -1911,11 +1911,9 @@ void mnist_train(
 
     // Create DNN layers
     MNISTArch *arch = NULL;
-    create_mnistarch(input_size, output_size, batch_size, &arch);
+    create_mnistarch(input_size, output_size, &arch);
 
-    // Assume load_mnist_batch loads the MNIST batch of images and labels
-    // You will need to implement this function or load the data accordingly.
-    
+    // load_mnist_batch loads the MNIST batch of images and labels
     for (int e = 1; e <= epoch; e++) {
         printf("Epoch: %d/%d\n\n", e, epoch);
         
@@ -2010,7 +2008,7 @@ void mnist_eval(
 
     // Create DNN layers
     MNISTArch *arch = NULL;
-    create_mnistarch(input_size, output_size, batch_size, &arch);
+    create_mnistarch(input_size, output_size, &arch);
 
     // Initialize DNN from the stored parameters
     load_tensor("./chckpts/checkpoint_9_ll1_W.txt", arch->ll1->W);
@@ -2049,6 +2047,337 @@ void mnist_eval(
     
     dispose_mnistarch(arch);
     dispose_mnist_dataset(dataset_size, image_size, mnist_images, mnist_labels);
+}
+
+/////////////////////////////////////////////////////////////////////
+
+typedef struct {
+    LinearLayer *ll1;
+    ActivationLayer *sm;
+    
+    NLLLoss *loss;
+} BigramArch;
+
+void create_bigramarch(int in_feature_size, int out_feature_size, BigramArch **out_arch) {
+    *out_arch = (BigramArch *)malloc(sizeof(BigramArch));
+
+    // Initialize DNN layers
+    (*out_arch)->ll1 = linearlayer(in_feature_size, out_feature_size, true);    // Input -> Hidden Layer 1
+    (*out_arch)->sm  = activation_layer(ct_softmax, 1);                         // Softmax
+
+    (*out_arch)->loss = nllloss();                                              // NLLLoss
+}
+
+void dispose_bigramarch(BigramArch *arch) {
+    dispose_linearlayer(arch->ll1);
+    dispose_activationlayer(arch->sm);
+
+    dispose_nllloss(arch->loss);
+}
+
+void bigramforwad(BigramArch *arch, Tensor *X, Tensor **y_pred) {
+    Tensor *y = NULL;
+
+    forward_linearlayer(arch->ll1, NULL, X, &y);
+    forward_activationlayer(arch->sm, arch->ll1->to_node, y, y_pred);
+}
+
+void bigramloss(BigramArch *arch, Tensor *y_pred, Tensor *target, Tensor **loss) {
+    forward_nllloss(arch->loss, arch->sm->to_node, y_pred, target, loss);
+}
+
+// Function to load the Bigram dataset from names file
+void load_bigram_dataset(
+    const char *names_file,
+    char ***out_bigram_pairs
+) {
+    FILE *file = fopen(names_file, "r");
+    if (file == NULL) {
+        printf("Error: Unable to open file %s\n", names_file);
+        exit(1);
+    }
+
+    // Step 1: Initialize dynamic tmp array with a starting "."
+    char *tmp = malloc(2);  // Start with 1 character for "." + 1 for null terminator
+    if (tmp == NULL) {
+        perror("Memory allocation error");
+        fclose(file);
+        exit(1);
+    }
+    strcpy(tmp, ".");
+
+    // Step 2: Append each line with a leading "\n" (except the first line)
+    char line[256];
+    bool is_first_line = true;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        int line_len = strlen(line);
+
+        // Remove newline character from the line
+        if (line[line_len - 1] == '\n') {
+            line[line_len - 1] = '\0';
+            line_len--;
+        }
+
+        // Calculate the new size needed for tmp and reallocate
+        int current_len = strlen(tmp);
+        int new_len = current_len + line_len + (is_first_line ? 0 : 1);
+        tmp = realloc(tmp, new_len + 1);  // +1 for null terminator
+        if (tmp == NULL) {
+            perror("Memory allocation error");
+            fclose(file);
+            exit(1);
+        }
+
+        // Append "\n" if it's not the first line
+        if (is_first_line == false) {
+            tmp[current_len] = '.';
+        } else {
+            is_first_line = 0;
+        }
+        
+        // Append the line to tmp
+        strcat(tmp, line);
+    }
+    fclose(file);
+
+    // Step 3: Add "." at the end of tmp
+    tmp = realloc(tmp, strlen(tmp) + 2);  // +2 for "." and null terminator
+    if (tmp == NULL) {
+        perror("Memory allocation error");
+        exit(1);
+    }
+    strcat(tmp, ".");
+
+    // Step 4: Create 2D array with moving window of 2 characters
+    int tmp_len = strlen(tmp);
+    *out_bigram_pairs = (char **)malloc((tmp_len - 1) * sizeof(char *));
+
+    for (int i = 0; i < tmp_len - 1; i++) {
+        (*out_bigram_pairs)[i] = (char*)malloc(2 * sizeof(char));
+        if ((*out_bigram_pairs)[i] == NULL) {
+            perror("Memory allocation error");
+            // Free previously allocated memory
+            for (int j = 0; j < i; j++) {
+                free((*out_bigram_pairs)[j]);
+            }
+            free(*out_bigram_pairs);
+            free(tmp);
+            exit(1);
+        }
+
+        (*out_bigram_pairs)[i][0] = tmp[i];
+        (*out_bigram_pairs)[i][1] = tmp[i + 1];
+    }
+
+    // Free allocated memory
+    free(tmp);
+}
+
+void dispose_bigram_dataset(
+    int num_pairs,
+    char **bigram_pairs
+) {
+    for (int i = 0; i < num_pairs; i++) {
+        free(bigram_pairs[i]);
+        bigram_pairs[i] = NULL;
+    }
+    free(bigram_pairs);
+    bigram_pairs = NULL;
+}
+
+// Function to load a batch of Bigram data into tensors X and Y
+void load_bigram_batch(
+    char **bigram_pairs,
+    int dataset_size,
+    int batch_idx,
+    int batch_size,
+    Tensor **out_X,
+    Tensor **out_Y
+) {
+    int start_idx = batch_idx * batch_size;
+    int actual_batch_size = (start_idx + batch_size < dataset_size) ? batch_size : dataset_size - start_idx;
+
+    create_tensor((int []){actual_batch_size, 27}, 2, out_X);   // From a-z plus "."
+    create_tensor((int []){actual_batch_size, 27}, 2, out_Y);   // From a-z plus "."
+    init_tensor(0.0, *out_X);
+    init_tensor(0.0, *out_Y);
+
+    // Loop through the batch and one_hot encode X/Y
+    for (int i = 0; i < actual_batch_size; i++) {
+        int src_idx = start_idx + i;
+
+        char chr0 = bigram_pairs[src_idx][0];
+        char chr1 = bigram_pairs[src_idx][1];
+        int enc_x = (chr0 == '.') ? 26 : chr0 - 'a';
+        int enc_y = (chr1 == '.') ? 26 : chr1 - 'a';
+        set_element(*out_X, 1.0, i, enc_x);
+        set_element(*out_Y, 1.0, i, enc_y);
+    }
+}
+
+void bigram_train(
+    const char *bigram_train_names_file
+) {
+    char **bigram_pairs = NULL;
+
+    int dataset_size = 228146;  // Adjust dataset size
+    int tokens_count = 27;      // From a-z plus "."
+
+    // Load the MNIST dataset from the CSV file
+    load_bigram_dataset(bigram_train_names_file, &bigram_pairs);
+
+    // Define hyperparameters
+    int training_size = dataset_size;
+    int batch_size = training_size;
+    int num_batches = ceil(training_size * 1.0 / batch_size);   // Number of batches in the epoch (adjust accordingly)
+    int num_batches_to_print = 100;                             // Number of batches in the epoch to print result
+    int epoch = 100;
+    double lr = 10;    // Learning rate
+
+    // Define DNN architecture: 27 -> 27
+    int input_size = tokens_count;
+    int output_size = tokens_count;
+
+    Tensor *tensor_lr = NULL;
+    create_tensor_from_scalar(lr, &tensor_lr);  // Learning rate as a scalar tensor
+
+    // Create DNN layers
+    BigramArch *arch = NULL;
+    create_bigramarch(input_size, output_size, &arch);
+    load_tensor("./chckpts/bigram_checkpoint_50_ll1_W.txt", arch->ll1->W);
+
+    // load_bigram_batch loads the Bigram batch of tokens
+    for (int e = 1; e <= epoch; e++) {
+        printf("Epoch: %d/%d\n\n", e, epoch);
+        
+        double accumulated_epoch_loss = 0.0;
+        for (int b = 0; b < num_batches; b++) {
+            // Placeholder for batch input and labels
+            Tensor *X = NULL, *Y = NULL;
+
+            // Load a batch of data (X, Y)
+            load_bigram_batch(bigram_pairs, training_size, b, batch_size, &X, &Y);
+
+            // Forward pass through the DNN
+            Tensor *y_pred = NULL;
+            bigramforwad(arch, X, &y_pred);
+
+            // Loss calculation
+            Tensor *out_loss = NULL;
+            bigramloss(arch, y_pred, Y, &out_loss);
+            accumulated_epoch_loss += out_loss->data[0];
+
+            // Backpropagation of gradients
+            backward(arch->loss->to_node);
+            
+            // Update weights
+            update_parameters(arch->loss->to_node, tensor_lr);
+
+            // Dispose computational graph and other stuff
+            dispose_graph(arch->loss->to_node);
+            dispose_tensor(X, true);
+            dispose_tensor(Y, true);
+        }
+        
+        printf("Total Averaged Loss: %.4f\n", accumulated_epoch_loss / (num_batches * 1.0));
+        printf("-------------------\n\n");
+
+        if (e % 50 == 0) {
+            // Decay learning rate
+            tensor_lr->data[0] /= 10;
+            
+            // Store parameters in proper files
+            char filename[50];
+            
+            sprintf(filename, "./chckpts/bigram_checkpoint_%d_ll1_W.txt", e);
+            store_tensor(filename, arch->ll1->W, 16);
+        }
+    }
+    
+    dispose_bigramarch(arch);
+    dispose_bigram_dataset(dataset_size, bigram_pairs);
+}
+
+// Function to pick an index with modified likelihood
+int pick_random_index(
+    double probabilities[],
+    int n,
+    double power
+) {
+    // Step 1: Apply the power to increase the likelihood of higher probabilities
+    double modified_probs[n];
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        modified_probs[i] = ct_pow(probabilities[i], power, NULL, NULL);
+        sum += modified_probs[i];
+    }
+
+    // Step 2: Normalize the modified probabilities
+    for (int i = 0; i < n; i++) {
+        modified_probs[i] /= sum;
+    }
+
+    // Step 3: Create a cumulative probability array
+    double cumulative_prob[n];
+    cumulative_prob[0] = modified_probs[0];
+    for (int i = 1; i < n; i++) {
+        cumulative_prob[i] = cumulative_prob[i - 1] + modified_probs[i];
+    }
+
+    // Step 4: Generate a random number between 0 and 1
+    double random_value = (double)rand() / RAND_MAX;
+
+    // Step 5: Find the first index where cumulative probability is >= random_value
+    for (int i = 0; i < n; i++) {
+        if (random_value <= cumulative_prob[i]) {
+            return i;
+        }
+    }
+
+    // Fallback (shouldn't happen if probabilities sum to 1)
+    return n - 1;
+}
+
+void bigram_test() {
+    // Define DNN architecture: 27 -> 27
+    int input_size = 27;
+    int output_size = 27;
+
+    // Create DNN layers
+    BigramArch *arch = NULL;
+    create_bigramarch(input_size, output_size, &arch);
+
+    // Initialize DNN from the stored parameters
+    load_tensor("./chckpts/bigram_checkpoint_100_ll1_W.txt", arch->ll1->W);
+
+    Tensor *X = NULL;
+    create_tensor((int []){1, 27}, 2, &X);
+
+    for (int i = 0; i < 10; i++) {
+        // Loop through the batch and one_hot encode X/Y
+        printf(".");
+        int idx = -1;
+        while (idx != 26) {
+            init_tensor(0.0, X);
+            set_element(X, 1.0, 0, idx == -1 ? 26 : idx);
+            
+            // Forward pass through the DNN
+            Tensor *y_pred = NULL;
+            bigramforwad(arch, X, &y_pred);
+
+            idx = pick_random_index(y_pred->data, y_pred->total_size, 2.7);
+
+            if (idx != 26) {
+                printf("%c", 'a' + idx);
+            }
+        }
+        printf(".\n");
+    }
+
+    // Dispose computational graph and other stuff
+    dispose_graph(arch->sm->to_node);
+    dispose_bigramarch(arch);
+    dispose_tensor(X, true);
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -2300,10 +2629,14 @@ int main(
 ) {
     setup_application(42);
 
-    mnist_train("./mnist_train_small.csv");
-    mnist_eval("./mnist_test.csv");
+    // mnist_train("./mnist_train_small.csv");
+    // mnist_eval("./mnist_test.csv");
+
+    // bigram_train("./names.txt");
+    bigram_test();
 
     // simple_test();
+
     // simple_test2();
 
     return 0;
