@@ -1,8 +1,5 @@
 #include "ctorch.c"
 
-#define SIMPLE_TEST_DATASET_SIZE 64000
-#define SIMPLE_TEST_FEATURE_SIZE 1
-
 void custom_activation_pow2(
     OpArgs args,
     Tensor **out_grad_a,
@@ -72,7 +69,7 @@ void simpleloss(SimpleArch *arch, Node *n_y_pred, Node *n_target, Node **n_loss)
     forward_mseloss(arch->loss, n_y_pred, n_target, n_loss);
 }
 
-void load_simple_test_dataset(
+void load_simple_dataset(
     int dataset_size,
     int feature_size,
     Tensor **out_X,
@@ -103,18 +100,23 @@ void load_simple_test_dataset(
     }
 }
 
-// Function to load a batch of simple_test data into tensors X and Y
-void load_simple_test_batch(
+// Function to load a batch of simple data into tensors X and Y
+void load_simple_batch(
     Tensor *X_dataset,
     Tensor *Y_dataset,
     int batch_idx,
     int batch_size,
     int feature_size,
     bool shuffle,
-    Tensor *io_X,
-    Tensor *io_Y
+    Tensor **out_X,
+    Tensor **out_Y
 ) {
     int start_idx = batch_idx * batch_size;
+
+    int X_shape[] = {batch_size, feature_size};
+    int Y_shape[] = {batch_size, feature_size};
+    create_tensor(X_shape, 2, out_X);
+    create_tensor(Y_shape, 2, out_Y);
 
     // Loop through the batch
     for (int i = 0; i < batch_size; i++) {
@@ -122,34 +124,28 @@ void load_simple_test_batch(
         for (int j = 0; j < feature_size; j++) {
             int multi_dim_idx[2] = {i, j};
             int idx = get_flat_index(X_dataset, multi_dim_idx);
-            set_element(io_X, X_dataset->data[idx], i, j);
-            set_element(io_Y, Y_dataset->data[idx], i, j);
+            set_element(*out_X, X_dataset->data[idx], i, j);
+            set_element(*out_Y, Y_dataset->data[idx], i, j);
         }
     }
 
     if (shuffle) {
-        shuffle_data(io_X, io_Y);
+        shuffle_data(*out_X, *out_Y);
     }
 }
 
-void simple_test() {
-    int dataset_size = SIMPLE_TEST_DATASET_SIZE;
-    int feature_size = SIMPLE_TEST_FEATURE_SIZE;
+void simple_train() {
+    int dataset_size = 64000;
+    int feature_size = 1;
 
-    int batch_size = 64000;
-    int num_batches = 1;
-    int epoch = 1000;
-    double lr = 0.01;
+    int training_size = dataset_size;
+    int batch_size = dataset_size;
+    int num_batches = ceil(training_size * 1.0 / batch_size);
+    int epoch = 100;
+    double lr = 0.1;
 
     Tensor *X_dataset = NULL, *Y_dataset = NULL;
-    load_simple_test_dataset(dataset_size, feature_size, &X_dataset, &Y_dataset);
-
-    // Placeholder for batch input and labels
-    int X_shape[] = {batch_size, feature_size};
-    int Y_shape[] = {batch_size, feature_size};
-    Tensor *X = NULL, *Y = NULL;
-    create_tensor(X_shape, 2, &X);
-    create_tensor(Y_shape, 2, &Y);
+    load_simple_dataset(dataset_size, feature_size, &X_dataset, &Y_dataset);
 
     Tensor *tensor_lr = NULL;
     create_tensor_from_scalar(lr, &tensor_lr);
@@ -166,7 +162,9 @@ void simple_test() {
         }
 
         for (int j = 0; j < num_batches; j++) {
-            load_simple_test_batch(X_dataset, Y_dataset, j, batch_size, feature_size, true, X, Y);
+                // Placeholder for batch input and labels
+            Tensor *X = NULL, *Y = NULL;
+            load_simple_batch(X_dataset, Y_dataset, j, batch_size, feature_size, true, &X, &Y);
 
             // Convert Tensors into Leaf Nodes
             Node *n_X = NULL, *n_Y= NULL;
@@ -218,7 +216,7 @@ int main(
 ) {
     setup_application(42);
 
-    simple_test();
+    simple_train();
 
     return 0;
 }
